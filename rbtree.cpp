@@ -5,6 +5,7 @@
 #include <chrono>
 #include <random>
 #include <shared_mutex>
+#include <deque>
 
 // single thread rbtree.
 // type KEY must implement operator< and operator==.
@@ -20,6 +21,9 @@ class RBTree {
   typedef Node* ListHeader;
   typedef Node* ListTailer;
   typedef Node* ListNext;
+
+  using Side = typename Node::Side;
+  using Color = typename Node::Color;
 
  public:
   RBTree() {
@@ -37,30 +41,20 @@ class RBTree {
 
   // find the node == value.
   Node* find(const VALUE& value) {
-    Node* node_no_greater_than_value = internalNoGreaterBound(root_->leftSon(), value, nullptr);
-    node_no_greater_than_value = node_no_greater_than_value == nullptr ? list_header_->next() : node_no_greater_than_value;
-    if (node_no_greater_than_value == list_tailer_ || node_no_greater_than_value->value() > value) {
-      // exactly all nodes are greater than value.
+    // return internalFind(root_->leftSon(), value);
+    Node* lower_bound = internalLowerbound(value);
+    if (lower_bound == nullptr || lower_bound->value() > value) {
       return nullptr;
+    } else {
+      // finally find the node == value.
+      return lower_bound;
     }
-    if (node_no_greater_than_value->value() == value) {
-      return node_no_greater_than_value;
-    }
-    // here node_no_greater_than_value < value
-    // find the target node across the sorted-list.
-    // very very bad case is that we should search from the first node.
-    while (node_no_greater_than_value->next() != list_tailer_ && node_no_greater_than_value->next()->value() < value) {
-      node_no_greater_than_value = node_no_greater_than_value->next();
-    }
-    Node* node_to_find =  node_no_greater_than_value->next();
-    if (node_to_find == list_tailer_ || node_to_find->value() > value) return nullptr;
-    else return node_to_find;
   }
 
   // find the first node >= value.
-  // Node* lowerBound(const VALUE& value) {
-  //   Node* node_no_greater_than_value = internalNoGreaterBound(root_->leftSon(), value, nullptr);
-  // }
+  Node* lowerBound(const VALUE& value) {
+    return internalLowerbound(value);
+  }
 
   // the insert operation would be ignored if key exists and return the Node* to the existed value,
   // otherwise execute insertion firstly.
@@ -118,9 +112,18 @@ class RBTree {
       Node* pre_list_node = findPreListNodeFromTreePath(erase_node, erase_path);
       Node* father_of_erase_node = erase_path.empty() ? root_ : erase_path.back();
       if (!erase_path.empty()) erase_path.pop_back(); // pop the father_of_erase_node
-      Side delete_side = detachAndDeleteLeafNode(erase_node, father_of_erase_node, pre_list_node);
-      // upward balance the rbtree.
-      balanceTheTreeAfterErase(father_of_erase_node, delete_side, erase_path);
+      // 1. detach erase_node from rbtree but keep being attached into sorted-list.
+      Side delete_side = father_of_erase_node->setSon(
+        father_of_erase_node->leftSon() == erase_node ? Node::LEFT : Node::RIGHT, nullptr);
+      // 2. upward balance the rbtree.
+      if (erase_node->color() == Node::BLACK && father_of_erase_node != root_) {
+        // ensure bro_of_delete_side must exist.
+        balanceTheTreeAfterErase(father_of_erase_node, delete_side, erase_path);
+      }
+      // 3. detach erase_node from sorted-list.
+      pre_list_node->setNext(erase_node->next());
+      // 4. finally delete erase_node.
+      delete erase_node;
     } else {
       // erase_node is a non-leaf node with two son.
 
@@ -147,33 +150,30 @@ class RBTree {
       erase_path.pop_back(); // pop the right_most_node
       Node* father_of_right_most_node = erase_path.back();
       erase_path.pop_back(); // pop the father_of_right_most_node
-      // 1. temporarily detach right_most_node from rbtree but keep being attached into sorted-list.
-      Side delete_side;
-      if (father_of_right_most_node->leftSon() == right_most_node) {
-        father_of_right_most_node->setLeftSon(nullptr);
-        delete_side = Side::LEFT;
-      } else {
-        father_of_right_most_node->setRightSon(nullptr);
-        delete_side = Side::RIGHT;
+      // 1. detach right_most_node from rbtree but keep being attached into sorted-list.
+      Side delete_side = father_of_right_most_node->setSon(
+        father_of_right_most_node->leftSon() == right_most_node ? Node::LEFT : Node::RIGHT, nullptr);
+      // 2. upward balance the rbtree.
+      if (right_most_node->color() == Node::BLACK && father_of_right_most_node != root_) {
+        // ensure bro_of_delete_side must exist.
+        balanceTheTreeAfterErase(father_of_right_most_node, delete_side, erase_path);
       }
-      // 2. point right_most_node's two sons to erase_node's two sons.
-      right_most_node->setLeftSon(erase_node->leftSon());
-      right_most_node->setRightSon(erase_node->rightSon());
-      // 3. attach the right_most_node to rbtree by being a son of father_of_erase_node
-      if (father_of_erase_node->leftSon() == erase_node) father_of_erase_node->setLeftSon(right_most_node);
-      else father_of_erase_node->setRightSon(right_most_node);
-      // 4. here the erase_node is detached from rbtree, detach it from sorted-list below.
+      // 3. find the erase_node for removing.
+      erase_path.clear();
+      internalFindErasePath(erase_value, erase_path);
+      erase_node = erase_path.back();
+      erase_path.pop_back();
+      father_of_erase_node = erase_path.empty() ? root_ : erase_path.back();
+      // 4. replace erase_node with right_most_node on erase_node's position in rbtree.
+      right_most_node->setSon(Node::LEFT, erase_node->leftSon());
+      right_most_node->setSon(Node::RIGHT, erase_node->rightSon());
+      right_most_node->setColor(erase_node->color());
+      father_of_erase_node->setSon(
+        father_of_erase_node->leftSon() == erase_node ? Node::LEFT : Node::RIGHT, right_most_node);
+      // 5. detach erase_node from sorted-list.
       right_most_node->setNext(erase_node->next());
-      // 5. here the erase_node is detached from rbtree and sorted-list, delete it. before delete erase_node, exchange it from erase_path by right_most_node
-      for (auto& node: erase_path) {
-        if (node == erase_node) {
-          node = right_most_node;
-          break;
-        }
-      }
+      // 6. finally delete erase_node.
       delete erase_node;
-      // 6. upward balance the rbtree.
-      balanceTheTreeAfterErase(father_of_right_most_node, delete_side, erase_path);
     }
     return true;
   }
@@ -201,8 +201,6 @@ class RBTree {
   }
 
  private:
-  enum Side { NODE, RIGHT, LEFT };
-
   // no-data node, left son is the true data root.
   TreeRoot root_;
   // no-data list node, as the header of the sorted list for all data node.
@@ -218,6 +216,38 @@ class RBTree {
     recursiveDestruction(curr_node->leftSon());
     recursiveDestruction(curr_node->rightSon());
     delete curr_node;
+  }
+
+  // find node == target_key.
+  Node* internalFind(Node* curr_node, const VALUE& target_value) {
+    if (curr_node == nullptr) {
+      return nullptr;
+    }
+    if (curr_node->value() == target_value) {
+      // the curr_node exactly equals to target key.
+      return curr_node;
+    } else if (curr_node->value() < target_value) {
+      return internalFind(curr_node->rightSon(), target_value);
+    }else {
+      return internalFind(curr_node->leftSon(), target_value);
+    }
+  }
+
+  // find the first node >= target_value.
+  Node* internalLowerbound(const VALUE& target_value) {
+    Node* no_greater_bound = internalNoGreaterBound(root_->leftSon(), target_value, nullptr);
+    // find the first node >= target_value across sorted-list.
+    Node* no_less_bound = no_greater_bound == nullptr ? list_header_ : no_greater_bound;
+    while (no_less_bound != list_tailer_ &&
+           (no_less_bound == list_header_ || no_less_bound->value() < target_value)) {
+      no_less_bound = no_less_bound->next();
+    }
+    if (no_less_bound == list_tailer_) {
+      return nullptr;
+    } else {
+      // finally find the first node >= target_key.
+      return no_less_bound;
+    }
   }
 
   // find last node <= target_key.
@@ -267,13 +297,13 @@ class RBTree {
       grand_father->setColor(Node::RED);
       grand_father->rightSon()->setColor(Node::BLACK);
       grand_father->rightSon()->rightSon()->setColor(Node::RED);
-      return Side::RIGHT;
+      return Node::RIGHT;
     }
     if (father->rightSon() == my_self) rotateLeft(father, grand_father);
     grand_father->setColor(Node::RED);
     grand_father->leftSon()->setColor(Node::BLACK);
     grand_father->leftSon()->leftSon()->setColor(Node::RED);
-    return Side::LEFT;
+    return Node::LEFT;
   }
 
   // this method is a recursive method, and it would execute upward balance across the insert_path.
@@ -297,7 +327,7 @@ class RBTree {
     Node* uncle = getBro(father, grand_father);
     if (uncle == nullptr || uncle->color() == Node::BLACK) {
       Side side = makeTreeGenSameSide(insert_node, father, grand_father);
-      if (side == Side::LEFT) rotateRight(grand_father, insert_path.empty() ? root_ : insert_path.back());
+      if (side == Node::LEFT) rotateRight(grand_father, insert_path.empty() ? root_ : insert_path.back());
       else rotateLeft(grand_father, insert_path.empty() ? root_ : insert_path.back());
       return;
     }
@@ -316,15 +346,11 @@ class RBTree {
     if (left_son == nullptr) {
       return nullptr;
     }
-    node->setLeftSon(left_son->rightSon());
-    left_son->setRightSon(node);
-    if (father->leftSon() == node) {
-      father->setLeftSon(left_son);
-      return left_son;
-    } else {
-      father->setRightSon(left_son);
-      return left_son;
-    }
+    node->setSon(Node::LEFT, left_son->rightSon());
+    left_son->setSon(Node::RIGHT, node);
+    father->setSon(
+      father->leftSon() == node ? Node::LEFT : Node::RIGHT, left_son);
+    return left_son;
   }
 
   // rotate-left the subtree rooted on node.
@@ -334,15 +360,10 @@ class RBTree {
     if (right_son == nullptr) {
       return nullptr;
     }
-    node->setRightSon(right_son->leftSon());
-    right_son->setLeftSon(node);
-    if (father->leftSon() == node) {
-      father->setLeftSon(right_son);
-      return right_son;
-    } else {
-      father->setRightSon(right_son);
-      return right_son;
-    }
+    node->setSon(Node::RIGHT, right_son->leftSon());
+    right_son->setSon(Node::LEFT, node);
+    father->setSon(father->leftSon() == node ? Node::LEFT : Node::RIGHT, right_son);
+    return right_son;
   }
 
   // find the nearest list node whose key is less than target_key.
@@ -365,82 +386,75 @@ class RBTree {
   }
 
   inline Node* broOfDeleteSide(Node* father, Side delete_side) {
-    if (delete_side == Side::LEFT) return father->rightSon();
+    if (delete_side == Node::LEFT) return father->rightSon();
     else return father->leftSon();
   }
 
   // recursive method. father_of_erase_node's delete_side-subtree has one node deleted.
   // erase_path doesn't contain father_of_erase_node.
   void balanceTheTreeAfterErase(Node* father_of_erase_node, Side delete_side, std::vector<Node*>& erase_path) {
+    // delete_side's subtree must be null or rooted with a BLACK node.
+    // bro_of_delete_side must exist.
+    bool increased_height;
+    Node* grand_fa = erase_path.empty() ? root_ : erase_path.back();
     Node* bro_of_delete_side = broOfDeleteSide(father_of_erase_node, delete_side);
-    if (bro_of_delete_side == nullptr) {
-      // two conditions match this if-branch:
-      // 1. father_of_erase_node is root_, and finally the height of rbtree reduces.
-      // 2. father_of_erase_node and erase_node together form a leaf node in 2-3-4 tree.
-      //    now the erase_node is destructed, so father_of_erase_node is the only member of the leaf node
-      //    and wouldn't change the height of the 2-3-4 tree.
-      return;
-    }
-    if (bro_of_delete_side->color() == Node::BLACK) {
-      // bro_of_delete_side won't be together with father_of_erase_node to as a node in 2-3-4 tree.
-      if (bro_of_delete_side->leftSon() != nullptr && bro_of_delete_side->leftSon()->color() == Node::RED) {
-        // we can use the left son of bro_of_delete_side to balance the tree.
-        Side side = makeTreeGenSameSide(bro_of_delete_side->leftSon(), bro_of_delete_side, father_of_erase_node);
-        Node* grand_father = erase_path.empty() ? root_ : erase_path.back();
-        Node* node;
-        if (side == Side::LEFT) node = rotateRight(father_of_erase_node, grand_father);
-        else node = rotateLeft(father_of_erase_node, grand_father);
-        node->setColor(father_of_erase_node->color());
-        node->leftSon()->setColor(Node::BLACK);
-        node->rightSon()->setColor(Node::BLACK);
-        return;
-      }
-      if (bro_of_delete_side->rightSon() != nullptr && bro_of_delete_side->rightSon()->color() == Node::RED) {
-        // we can use the right son of bro_of_delete_side to balance the tree.
-        Side side = makeTreeGenSameSide(bro_of_delete_side->rightSon(), bro_of_delete_side, father_of_erase_node);
-        Node* grand_father = erase_path.empty() ? root_ : erase_path.back();
-        Node* node;
-        if (side == Side::LEFT) node = rotateRight(father_of_erase_node, grand_father);
-        else node = rotateLeft(father_of_erase_node, grand_father);
-        node->setColor(father_of_erase_node->color());
-        node->leftSon()->setColor(Node::BLACK);
-        node->rightSon()->setColor(Node::BLACK);
-        return;
-      }
-      // bro_of_delete_side can not help, try to ask father_of_erase_node.
-      if (father_of_erase_node->color() == Node::RED) {
-        // father_of_erase_node can help.
-        Node::SwapColor(father_of_erase_node, bro_of_delete_side);
-        return;
-      } else {
-        // father_of_erase_node can not help;
-        bro_of_delete_side->setColor(Node::RED);
-        Node* grand_father = erase_path.empty() ? root_ : erase_path.back();
-        if (!erase_path.empty()) erase_path.pop_back();
-        return balanceTheTreeAfterErase(grand_father, grand_father->leftSon() == father_of_erase_node ? Side::LEFT : Side::RIGHT, erase_path);
-      }
+    if (father_of_erase_node->color() == Node::BLACK && bro_of_delete_side->color() == Node::RED) {
+      // 1. bro is RED.
+      increased_height = true;
+      if (delete_side == Node::LEFT) rotateLeft(father_of_erase_node, grand_fa);
+      else rotateRight(father_of_erase_node, grand_fa);
+      bro_of_delete_side->setColor(Node::BLACK);
+      grand_fa = bro_of_delete_side;
+      // new bro must exist.
+      bro_of_delete_side = broOfDeleteSide(father_of_erase_node, delete_side);
+    } else if (father_of_erase_node->color() == Node::RED && bro_of_delete_side->color() == Node::BLACK) {
+      // 2. fa is RED;
+      increased_height = true;
+      father_of_erase_node->setColor(Node::BLACK);
     } else {
-      // bro_of_delete_side must be together with father_of_erase_node to as a node in 2-3-4 tree.
-      // father_of_erase_node must be BLACK.
-      // bro_of_delete_side must have 0 son or 2 sons.
-      if (bro_of_delete_side->leftSon() == nullptr && bro_of_delete_side->rightSon() == nullptr) {
-        // the erase node must be RED and together with bro_of_delete_side and father_of_erase_node to be a node in 2-3-4 tree.
+      // 3. no-one is RED.
+      increased_height = false;
+    }
+    // here both fa and bro are BLACK.
+    // increased_height is true means we need to decrease bro's height.
+    // increased_height is false means we need to increase delete_side's height.
+    if ((bro_of_delete_side->leftSon() == nullptr || bro_of_delete_side->leftSon()->color() == Node::BLACK) &&
+        (bro_of_delete_side->rightSon() == nullptr || bro_of_delete_side->rightSon()->color() == Node::BLACK)) {
+      // bro can safely be colored with RED.
+      bro_of_delete_side->setColor(Node::RED);
+      if (increased_height || erase_path.empty()) {
         return;
       } else {
-        // bro_of_delete_side must have 2 sons here.
-        Node* grand_father = erase_path.empty() ? root_ : erase_path.back();
-        Node* node;
-        Side bro_side;
-        if (father_of_erase_node->leftSon() == bro_of_delete_side) node = rotateRight(father_of_erase_node, grand_father), bro_side = Side::LEFT;
-        else node = rotateLeft(father_of_erase_node, grand_father), bro_side = Side::RIGHT;
-        node->setColor(Node::BLACK);
-        node->leftSon()->setColor(Node::BLACK);
-        node->rightSon()->setColor(Node::BLACK);
-        if (bro_side == Side::RIGHT) node->leftSon()->rightSon()->setColor(Node::RED);
-        else node->rightSon()->leftSon()->setColor(Node::RED);
-        return;
+        Node* grand_fa = erase_path.back();
+        erase_path.pop_back();
+        return balanceTheTreeAfterErase(grand_fa, grand_fa->leftSon() == father_of_erase_node ? Node::LEFT : Node::RIGHT, erase_path);
       }
     }
+    // here either bro's left son or right son is RED (or both RED).
+    // for example, if delete_side is LEFT, we need to ensure the RED node is bro's right son, and vice versa.
+    // and then we can use the RED node to balance the fa subtree.
+    if (delete_side == Node::LEFT && (bro_of_delete_side->rightSon() == nullptr || bro_of_delete_side->rightSon()->color() == Node::BLACK)) {
+      Node::SwapColor(bro_of_delete_side, bro_of_delete_side->leftSon());
+      rotateRight(bro_of_delete_side, father_of_erase_node);
+      bro_of_delete_side = broOfDeleteSide(father_of_erase_node, delete_side);
+      // now bro's right son is RED, we use it.
+    } else if (delete_side == Node::RIGHT && (bro_of_delete_side->leftSon() == nullptr || bro_of_delete_side->leftSon()->color() == Node::BLACK)) {
+      Node::SwapColor(bro_of_delete_side, bro_of_delete_side->rightSon());
+      rotateLeft(bro_of_delete_side, father_of_erase_node);
+      bro_of_delete_side = broOfDeleteSide(father_of_erase_node, delete_side);
+      // now bro's left son is RED, we use it.
+    }
+    if (delete_side == Node::LEFT) {
+      bro_of_delete_side->rightSon()->setColor(Node::BLACK);
+      rotateLeft(father_of_erase_node, grand_fa);
+    } else {
+      bro_of_delete_side->leftSon()->setColor(Node::BLACK);
+      rotateRight(father_of_erase_node, grand_fa);
+    }
+    if (increased_height) {
+      bro_of_delete_side->setColor(Node::RED);
+    }
+    return;
   }
 
   // create a new insert_node, and then attach the node into sorted list and rbtree.
@@ -456,34 +470,17 @@ class RBTree {
     insert_node->setNext(pre_list_node->next());
     pre_list_node->setNext(insert_node);
     // 2. insert node into rbtree.
-    if (insert_path.empty()) root_->setLeftSon(insert_node);
-    else if (value < insert_path.back()->value()) insert_path.back()->setLeftSon(insert_node);
-    else if (value > insert_path.back()->value()) insert_path.back()->setRightSon(insert_node);
+    if (insert_path.empty()) root_->setSon(Node::LEFT, insert_node);
+    else if (value < insert_path.back()->value()) insert_path.back()->setSon(Node::LEFT, insert_node);
+    else if (value > insert_path.back()->value()) insert_path.back()->setSon(Node::RIGHT, insert_node);
     return insert_node;
-  }
-
-  // detach the delete_node from sorted list and rbtree, and then destruct the physical node.
-  // caller MUST make sure the right relationship between all incoming nodes.
-  // caller MUST make sure the delete_node is a leaf node.
-  // return which side the delete_node is inside his father.
-  Side detachAndDeleteLeafNode(Node* delete_node, Node* father_node, Node* pre_list_node) {
-    Side delete_side;
-    pre_list_node->setNext(delete_node->next());
-    if (father_node->leftSon() == delete_node) {
-      delete_side = Side::LEFT;
-      father_node->setLeftSon(nullptr);
-    } else {
-      delete_side = Side::RIGHT;
-      father_node->setRightSon(nullptr);
-    }
-    delete delete_node;
-    return delete_side;
   }
 };
 
 template <typename VALUE>
 class RBTree<VALUE>::Node {
  public:
+  enum Side { RIGHT, LEFT };
   enum Color { RED, BLACK };
 
   explicit Node()
@@ -519,16 +516,14 @@ class RBTree<VALUE>::Node {
     return left_son_;
   }
 
-  inline void setLeftSon(LeftSon new_left_son) {
-    left_son_ = new_left_son;
-  }
-
   inline Node* rightSon() const {
     return right_son_;
   }
 
-  inline void setRightSon(RightSon new_right_son) {
-    right_son_ = new_right_son;
+  inline Side setSon(Side side, Node* new_son) {
+    if (side == LEFT) left_son_ = new_son;
+    else right_son_ = new_son;
+    return side;
   }
 
   inline Node* next() const {
@@ -552,30 +547,93 @@ class RBTree<VALUE>::Node {
 
 int main() {
   RBTree<int> my_map;
-  std::random_device rd;          // Áî®‰∫éÁîüÊàêÁúüÈöèÊú∫ÁßçÂ≠êÔºàÂ¶? /dev/urandomÔº?
-  std::mt19937 gen(rd());         // ‰ΩøÁî®Ê¢ÖÊ£ÆÊóãËΩ¨ÁÆóÊ≥ï‰Ωú‰∏∫ÂºïÊìé
-  std::uniform_int_distribution<> dis(0, 10000000); // ÁîüÊàê [1, 100] ÁöÑÂùáÂåÄÊï¥Êï∞
-  for (int i = 0; i < 1000000; i++) {
-    int a = dis(gen);
-    if (my_map.find(a) != nullptr) i--;
-    else my_map.insert(a);
+  // auto insert_ope = [&my_map](std::string str) {
+  //   std::vector<int> vec;
+  //   int val = 0;
+  //   for (char ch: str) {
+  //     if (ch == ' ') {
+  //       vec.push_back(val);
+  //       val = 0;
+  //       continue;
+  //     }
+  //     val = val * 10 + (ch - '0');
+  //   }
+  //   for (auto ele: vec) {
+  //     my_map.insert(ele);
+  //   }
+  // };
+  // auto erase_ope = [&my_map](std::string str) {
+  //   std::vector<int> vec;
+  //   int val = 0;
+  //   for (char ch: str) {
+  //     if (ch == ' ') {
+  //       vec.push_back(val);
+  //       val = 0;
+  //       continue;
+  //     }
+  //     val = val * 10 + (ch - '0');
+  //   }
+  //   for (auto ele: vec) {
+  //     my_map.erase(ele);
+  //   }
+  // };
+  // insert_ope("46791 104199 307251 269892 340107 400543 370317 313340 ");
+  // erase_ope("46791 104199 269892 307251 313340 340107 370317 ");
+  // insert_ope("312752 276687 401431 328401 8256 412274 289161 352791 ");
+  // erase_ope("8256 276687 289161 312752 328401 352791 400543 401431 ");
+  // insert_ope("264344 175455 214064 364253 157010 297713 271627 459027");
+  // erase_ope("157010 175455 214064 264344 271627 297713 364253");
+  // insert_ope("15719 157007 124648 49497 461182 392276 439617 336161");
+  // erase_ope("15719 49497 124648 157007 336161 392276 412274");
+  // insert_ope("445796 66649 200945 360582 335677 10645 467303 397841");
+  // erase_ope("66649 200945 335677 360582 397841 439617");
+  // insert_ope("35773 209374 252150 72277 247561 187520 21425 318531");
+  // erase_ope("10645 21425 35773 72277 187520 209374 247561 252150 318531");
+  // insert_ope("300244 113744 41332 457078 301142 104210 182666 110111");
+  // erase_ope("41332 104210 110111 113744 182666 300244 301142");
+  // insert_ope("");
+  // erase_ope("");
+  int times = 100;
+  std::deque<int> vec_for_map;
+  int max_val = 0;
+  while (times--) {
+    std::random_device rd;          // Áî®‰∫éÁîüÊàêÁúüÈöèÊú∫ÁßçÂ≠êÔºàÂ¶? /dev/urandomÔº?
+    std::mt19937 gen(rd());         // ‰ΩøÁî®Ê¢ÖÊ£ÆÊóãËΩ¨ÁÆóÊ≥ï‰Ωú‰∏∫ÂºïÊìé
+    std::uniform_int_distribution<> dis(0, 100000000); // ÁîüÊàê [1, 100] ÁöÑÂùáÂåÄÊï¥Êï∞
+    for (int i = 0; i < 128 * 1024; i++) {
+      int a = dis(gen);
+      // int a = max_val++;
+      if (my_map.find(a) != nullptr) i--;
+      else my_map.insert(a), vec_for_map.push_back(a);
+    }
+    // std::cout << "insert_list: ";
+    // for (int i = 0; i < 8; i++) {
+    //   int a = dis(gen);
+    //   std::cout << "find... ";
+    //   if (my_map.find(a) != nullptr) i--;
+    //   else std::cout << a << " ", my_map.insert(a);
+    // }
+    // std::cout << "\n";
+    int newest_max_height = INT32_MIN;
+    int newest_min_height = INT32_MAX;
+    int node_count = 0;
+    my_map.getHeightInfoForTest(my_map.getRootForTest(), 0, newest_max_height, newest_min_height, node_count);
+    std::cout << newest_max_height << " " << newest_min_height << " " << node_count - 1 << "\n";
+    for (int i = 0; i < 128 * 1024; i++) {
+      if (!my_map.erase(vec_for_map.front())) i--;
+      else vec_for_map.pop_front();
+    }
+    // std::cout << "erase_list: ";
+    // for (auto ele: erase_list) std::cout << ele << " ";
+    // std::cout << "\n";
+    newest_max_height = INT32_MIN;
+    newest_min_height = INT32_MAX;
+    node_count = 0;
+    my_map.getHeightInfoForTest(my_map.getRootForTest(), 0, newest_max_height, newest_min_height, node_count);
+    std::cout << newest_max_height << " " << newest_min_height << " " << node_count - 1 << "\n";
+    std::cout << "\n";
+    // for (int i = 7; i >= 0; i--) {
+    //   my_map.erase(i);
+    // }
   }
-  int newest_max_height = INT32_MIN;
-  int newest_min_height = INT32_MAX;
-  int node_count = 0;
-  my_map.getHeightInfoForTest(my_map.getRootForTest(), 0, newest_max_height, newest_min_height, node_count);
-  std::cout << newest_max_height << " " << newest_min_height << " " << node_count - 1 << "\n";
-  RBTree<int>::Node* start_node = my_map.getRootForTest()->leftSon();
-  int end_value = start_node->value() + 100086;
-  // while(start_node != my_map.getTailer() && start_node->value() <= end_value) {
-  //   std::cout << start_node->value() << " ";
-  //   start_node = start_node->next();
-  // }
-  // std::cout << "\n";
-  for (int i = start_node->value() + 1000; i <= start_node->value() + 10000; i++) my_map.erase(i);
-  // while(start_node != my_map.getTailer() && start_node->value() <= end_value) {
-  //   std::cout << start_node->value() << " ";
-  //   start_node = start_node->next();
-  // }
-  // std::cout << "\n";
 }
