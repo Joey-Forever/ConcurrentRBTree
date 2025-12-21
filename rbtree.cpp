@@ -2,10 +2,12 @@
 #include <vector>
 #include <atomic>
 #include <map>
+#include <set>
 #include <chrono>
 #include <random>
 #include <shared_mutex>
 #include <deque>
+#include <thread>
 
 // single thread rbtree.
 // type KEY must implement operator< and operator==.
@@ -48,6 +50,16 @@ class RBTree {
     } else {
       // finally find the node == value.
       return lower_bound;
+    }
+  }
+
+  // value must exist.
+  bool findForConcurrentTest(const VALUE& value) {
+    Node* no_greater_bound = internalNoGreaterBound(root_->leftSon(), value, nullptr);
+    if (no_greater_bound == nullptr || no_greater_bound->value() != value) {
+      return false;
+    } else {
+      return true;
     }
   }
 
@@ -495,9 +507,9 @@ class RBTree<VALUE>::Node {
   // when a node is going to be destructed, caller MUST make sure firstly that the node
   // is detached from rbtree and that the list-node is detached from sorted list.
   ~Node() {
-    left_son_ = nullptr;
-    right_son_ = nullptr;
-    next_ = nullptr;
+    left_son_.store(nullptr);
+    right_son_.store(nullptr);
+    next_.store(nullptr);
   }
 
   static void SwapColor(Node* node1, Node* node2) {
@@ -513,25 +525,25 @@ class RBTree<VALUE>::Node {
   inline void setColor(Color new_color) { color_ = new_color; }
 
   inline Node* leftSon() const {
-    return left_son_;
+    return left_son_.load();
   }
 
   inline Node* rightSon() const {
-    return right_son_;
+    return right_son_.load();
   }
 
   inline Side setSon(Side side, Node* new_son) {
-    if (side == LEFT) left_son_ = new_son;
-    else right_son_ = new_son;
+    if (side == LEFT) left_son_.store(new_son);
+    else right_son_.store(new_son);
     return side;
   }
 
   inline Node* next() const {
-    return next_;
+    return next_.load();
   }
 
   inline void setNext(ListNext new_next) {
-    next_ = new_next;
+    next_.store(new_next);
   }
 
  private:
@@ -540,59 +552,15 @@ class RBTree<VALUE>::Node {
   Color color_;
 
   // pointer region
-  LeftSon left_son_;
-  RightSon right_son_;
-  ListNext next_;
+  std::atomic<LeftSon> left_son_;
+  std::atomic<RightSon> right_son_;
+  std::atomic<ListNext> next_;
 };
 
-int main() {
+static void TestSingleThreadAbility(bool sequential_insert) {
+  std::cout << "------------------------------------------------------------------------------------------------" << "\n";
+  std::cout << "single thread test (sequential_insert = " << (sequential_insert ? "true" : "false") << "):\n";
   RBTree<int> my_map;
-  // auto insert_ope = [&my_map](std::string str) {
-  //   std::vector<int> vec;
-  //   int val = 0;
-  //   for (char ch: str) {
-  //     if (ch == ' ') {
-  //       vec.push_back(val);
-  //       val = 0;
-  //       continue;
-  //     }
-  //     val = val * 10 + (ch - '0');
-  //   }
-  //   for (auto ele: vec) {
-  //     my_map.insert(ele);
-  //   }
-  // };
-  // auto erase_ope = [&my_map](std::string str) {
-  //   std::vector<int> vec;
-  //   int val = 0;
-  //   for (char ch: str) {
-  //     if (ch == ' ') {
-  //       vec.push_back(val);
-  //       val = 0;
-  //       continue;
-  //     }
-  //     val = val * 10 + (ch - '0');
-  //   }
-  //   for (auto ele: vec) {
-  //     my_map.erase(ele);
-  //   }
-  // };
-  // insert_ope("46791 104199 307251 269892 340107 400543 370317 313340 ");
-  // erase_ope("46791 104199 269892 307251 313340 340107 370317 ");
-  // insert_ope("312752 276687 401431 328401 8256 412274 289161 352791 ");
-  // erase_ope("8256 276687 289161 312752 328401 352791 400543 401431 ");
-  // insert_ope("264344 175455 214064 364253 157010 297713 271627 459027");
-  // erase_ope("157010 175455 214064 264344 271627 297713 364253");
-  // insert_ope("15719 157007 124648 49497 461182 392276 439617 336161");
-  // erase_ope("15719 49497 124648 157007 336161 392276 412274");
-  // insert_ope("445796 66649 200945 360582 335677 10645 467303 397841");
-  // erase_ope("66649 200945 335677 360582 397841 439617");
-  // insert_ope("35773 209374 252150 72277 247561 187520 21425 318531");
-  // erase_ope("10645 21425 35773 72277 187520 209374 247561 252150 318531");
-  // insert_ope("300244 113744 41332 457078 301142 104210 182666 110111");
-  // erase_ope("41332 104210 110111 113744 182666 300244 301142");
-  // insert_ope("");
-  // erase_ope("");
   int times = 100;
   std::deque<int> vec_for_map;
   int max_val = 0;
@@ -601,19 +569,12 @@ int main() {
     std::mt19937 gen(rd());         // ‰ΩøÁî®Ê¢ÖÊ£ÆÊóãËΩ¨ÁÆóÊ≥ï‰Ωú‰∏∫ÂºïÊìé
     std::uniform_int_distribution<> dis(0, 100000000); // ÁîüÊàê [1, 100] ÁöÑÂùáÂåÄÊï¥Êï∞
     for (int i = 0; i < 128 * 1024; i++) {
-      int a = dis(gen);
-      // int a = max_val++;
+      int a;
+      if (!sequential_insert) a = dis(gen);
+      else a = max_val++;
       if (my_map.find(a) != nullptr) i--;
       else my_map.insert(a), vec_for_map.push_back(a);
     }
-    // std::cout << "insert_list: ";
-    // for (int i = 0; i < 8; i++) {
-    //   int a = dis(gen);
-    //   std::cout << "find... ";
-    //   if (my_map.find(a) != nullptr) i--;
-    //   else std::cout << a << " ", my_map.insert(a);
-    // }
-    // std::cout << "\n";
     int newest_max_height = INT32_MIN;
     int newest_min_height = INT32_MAX;
     int node_count = 0;
@@ -623,17 +584,125 @@ int main() {
       if (!my_map.erase(vec_for_map.front())) i--;
       else vec_for_map.pop_front();
     }
-    // std::cout << "erase_list: ";
-    // for (auto ele: erase_list) std::cout << ele << " ";
-    // std::cout << "\n";
     newest_max_height = INT32_MIN;
     newest_min_height = INT32_MAX;
     node_count = 0;
     my_map.getHeightInfoForTest(my_map.getRootForTest(), 0, newest_max_height, newest_min_height, node_count);
     std::cout << newest_max_height << " " << newest_min_height << " " << node_count - 1 << "\n";
     std::cout << "\n";
-    // for (int i = 7; i >= 0; i--) {
-    //   my_map.erase(i);
-    // }
   }
+}
+
+static void TestOneWriteMultiReadConcurrentPerf(int perf_max_try_times, bool is_worst_case) {
+  std::cout << "------------------------------------------------------------------------------------------------" << "\n";
+  std::cout << "concurrent test --- one write, multi read (perf_max_try_times = " << perf_max_try_times << ", is_worst_case = " << (is_worst_case ? "true" : "false") << "):\n";
+  RBTree<int> my_map;
+  std::atomic<int> my_map_size(0);
+  std::set<int> init_set, random_set_for_insert;
+  std::vector<int> init_list, random_list_for_insert;
+  const int INIT_DATA_COUNT = 1024;
+  const int DATA_COUNT_FOR_INSERTION = 100000;
+  const int MAX_TRY_TIMES = INT32_MAX;
+  // x86-64 intel (11 read threads):
+  // random case (random insert value and random find value):
+  // try_times = 1 : 99.9997%
+  // try_times = 2 : 100%
+  // worst case (sequential insert and always find the last insert value):
+  // try_times = 1 : 95%
+  // try_times = 2 : 99.995%
+  const int PERF_MAX_TRY_TIMES = perf_max_try_times;
+  const int READ_THREAD_COUNT = 11;
+  std::random_device rd;          // Áî®‰∫éÁîüÊàêÁúüÈöèÊú∫ÁßçÂ≠êÔºàÂ¶? /dev/urandomÔº?
+  std::mt19937 gen(rd());         // ‰ΩøÁî®Ê¢ÖÊ£ÆÊóãËΩ¨ÁÆóÊ≥ï‰Ωú‰∏∫ÂºïÊìé
+  std::uniform_int_distribution<> dis(0, 100000000); // ÁîüÊàê [1, 100] ÁöÑÂùáÂåÄÊï¥Êï∞
+  int value = 0;
+  auto gen_value = [&gen, &dis, &value, is_worst_case]() -> int {
+    int a;
+    if (!is_worst_case) a = dis(gen);
+    else a = value++; // worst case: sequential insert
+    return a;
+  };
+  for (int i = 0; i < INIT_DATA_COUNT; i++) {
+    int a = gen_value();
+    if (init_set.find(a) != init_set.end()) i--;
+    else init_set.insert(a), init_list.push_back(a), my_map.insert(a);
+  }
+  my_map_size.store(INIT_DATA_COUNT);
+  for (int i = 0; i < DATA_COUNT_FOR_INSERTION; i++) {
+    int a = gen_value();
+    if (init_set.find(a) != init_set.end() || random_set_for_insert.find(a) != random_set_for_insert.end()) i--;
+    else random_set_for_insert.insert(a), random_list_for_insert.push_back(a);
+  }
+  std::atomic<bool> insert_over(false);
+  auto insert_ope = [&my_map, &my_map_size, &random_list_for_insert, &insert_over]() {
+    for (const auto ele: random_list_for_insert) {
+      my_map.insert(ele);
+      my_map_size.fetch_add(+1);
+    }
+    insert_over.store(true);
+  };
+  std::atomic<int> tot_find_times(0);
+  std::atomic<int> success_find_times(0);
+  std::atomic<int> perf_find_times(0);
+  std::atomic<int> max_try_times(0);
+  auto find_ope = [&my_map, &my_map_size, &insert_over, &init_list, &random_list_for_insert,
+                   &tot_find_times, &success_find_times, &perf_find_times, &max_try_times, PERF_MAX_TRY_TIMES, is_worst_case]() {
+    int idx = 0;
+    while(!insert_over.load()) {
+      int value;
+      if (is_worst_case) idx = my_map_size.load() - 1; // worst case: always find the last insert value
+      if (idx < INIT_DATA_COUNT) value = init_list[idx];
+      else if (idx < my_map_size.load()) value = random_list_for_insert[idx - INIT_DATA_COUNT];
+      else idx = 0, value = init_list[idx];
+      bool result;
+      // try_times的次数越多，说明find操作受旋转操作而导致红黑树失效的次数越多，和value存在与否无关。当然，测试时为了方便，保证了value在find时必然存在的。
+      int try_times = 0;
+      do {
+        // value must exist.
+        result = my_map.findForConcurrentTest(value);
+        try_times++;
+      } while(!result && try_times < MAX_TRY_TIMES);
+      tot_find_times.fetch_add(+1);
+      if (result) success_find_times.fetch_add(+1);
+      if (result && try_times <= PERF_MAX_TRY_TIMES) perf_find_times.fetch_add(+1);
+      int local_max_try_times = max_try_times.load();
+      do {
+        if (local_max_try_times >= try_times) break;
+      } while(!max_try_times.compare_exchange_strong(local_max_try_times, try_times));
+      idx++;
+    }
+  };
+  std::thread write_thread(insert_ope);
+  std::vector<std::thread> read_threads;
+
+  for (int i = 0; i < READ_THREAD_COUNT; i++) {
+    read_threads.emplace_back(find_ope);
+  }
+
+  write_thread.join();
+  for (auto& t : read_threads) {
+    t.join();
+  }
+  double tot = tot_find_times.load();
+  double success = success_find_times.load();
+  double perf = perf_find_times.load();
+
+  double success_rate = success / tot;
+  double perf_rate = perf / tot;
+  std::cout << "tot = " << tot_find_times.load() << ", success = " << success_find_times.load() << ", perf = " << perf_find_times.load() << ", max try times = " << max_try_times.load() << "\n";
+  std::cout << "success rate: " << success_rate * 100.0 << "%\n";
+  std::cout << "perf rate: " << perf_rate * 100.0 << "%\n";
+
+  int newest_max_height = INT32_MIN;
+  int newest_min_height = INT32_MAX;
+  int node_count = 0;
+  my_map.getHeightInfoForTest(my_map.getRootForTest(), 0, newest_max_height, newest_min_height, node_count);
+  std::cout << newest_max_height << " " << newest_min_height << " " << node_count - 1 << "\n";
+}
+
+int main() {
+  TestOneWriteMultiReadConcurrentPerf(2, false);
+  TestOneWriteMultiReadConcurrentPerf(2, true);
+  TestSingleThreadAbility(false);
+  TestSingleThreadAbility(true);
 }
