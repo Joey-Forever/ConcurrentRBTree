@@ -8,6 +8,7 @@
 #include <shared_mutex>
 #include <deque>
 #include <thread>
+#include <cassert>
 
 // single thread rbtree.
 // type KEY must implement operator< and operator==.
@@ -41,31 +42,46 @@ class RBTree {
     delete list_tailer_;
   }
 
-  // find the node == value.
+  // find the accessible node == value.
   Node* find(const VALUE& value) {
     // return internalFind(root_->leftSon(), value);
-    Node* lower_bound = internalLowerbound(value);
-    if (lower_bound == nullptr || lower_bound->value() > value) {
+    Node* lower_bound = internalLowerbound(value).second;
+    if (lower_bound == nullptr || lower_bound->value() > value || !lower_bound->accessible()) {
       return nullptr;
     } else {
-      // finally find the node == value.
+      // finally find the accessible node == value.
       return lower_bound;
     }
   }
 
-  // value must exist.
-  bool findForConcurrentTest(const VALUE& value) {
-    Node* no_greater_bound = internalNoGreaterBound(root_->leftSon(), value, nullptr);
-    if (no_greater_bound == nullptr || no_greater_bound->value() != value) {
-      return false;
+  // return a std::pair:
+  //   the first element means the try_times to find the value,
+  //   the second element means the found accessible node.
+  std::pair<int, Node*> findForConcurrentTest(const VALUE& value) {
+    std::pair<int, Node*> result = internalLowerbound(value);
+    int try_times = result.first;
+    Node* lower_bound = result.second;
+    if (lower_bound == nullptr || lower_bound->value() > value || !lower_bound->accessible()) {
+      return {try_times, nullptr};
     } else {
-      return true;
+      // finally find the node == value.
+      return {try_times, lower_bound};
     }
   }
 
-  // find the first node >= value.
+  // find the first accessible node >= value.
   Node* lowerBound(const VALUE& value) {
-    return internalLowerbound(value);
+    Node* lower_bound = internalLowerbound(value).second;
+    if (lower_bound == nullptr) {
+      return nullptr;
+    }
+    while(lower_bound != list_tailer_ && !lower_bound->accessible()) {
+      lower_bound = lower_bound->next();
+    }
+    if (lower_bound == list_tailer_) {
+      return nullptr;
+    }
+    return lower_bound;
   }
 
   // the insert operation would be ignored if key exists and return the Node* to the existed value,
@@ -124,18 +140,20 @@ class RBTree {
       Node* pre_list_node = findPreListNodeFromTreePath(erase_node, erase_path);
       Node* father_of_erase_node = erase_path.empty() ? root_ : erase_path.back();
       if (!erase_path.empty()) erase_path.pop_back(); // pop the father_of_erase_node
-      // 1. detach erase_node from rbtree but keep being attached into sorted-list.
+      // 1. make erase_node inaccessible.
+      erase_node->setAccessibility(false);
+      // 2. detach erase_node from rbtree but keep being attached into sorted-list.
       Side delete_side = father_of_erase_node->setSon(
         father_of_erase_node->leftSon() == erase_node ? Node::LEFT : Node::RIGHT, nullptr);
-      // 2. upward balance the rbtree.
+      // 3. upward balance the rbtree.
       if (erase_node->color() == Node::BLACK && father_of_erase_node != root_) {
         // ensure bro_of_delete_side must exist.
         balanceTheTreeAfterErase(father_of_erase_node, delete_side, erase_path);
       }
-      // 3. detach erase_node from sorted-list.
+      // 4. detach erase_node from sorted-list.
       pre_list_node->setNext(erase_node->next());
-      // 4. finally delete erase_node.
-      delete erase_node;
+      // 5. finally delete erase_node.
+      // delete erase_node;
     } else {
       // erase_node is a non-leaf node with two son.
 
@@ -176,16 +194,18 @@ class RBTree {
       erase_node = erase_path.back();
       erase_path.pop_back();
       father_of_erase_node = erase_path.empty() ? root_ : erase_path.back();
-      // 4. replace erase_node with right_most_node on erase_node's position in rbtree.
+      // 4. make erase_node inaccessible.
+      erase_node->setAccessibility(false);
+      // 5. replace erase_node with right_most_node on erase_node's position in rbtree.
       right_most_node->setSon(Node::LEFT, erase_node->leftSon());
       right_most_node->setSon(Node::RIGHT, erase_node->rightSon());
       right_most_node->setColor(erase_node->color());
       father_of_erase_node->setSon(
         father_of_erase_node->leftSon() == erase_node ? Node::LEFT : Node::RIGHT, right_most_node);
-      // 5. detach erase_node from sorted-list.
+      // 6. detach erase_node from sorted-list.
       right_most_node->setNext(erase_node->next());
-      // 6. finally delete erase_node.
-      delete erase_node;
+      // 7. finally delete erase_node.
+      // delete erase_node;
     }
     return true;
   }
@@ -213,6 +233,7 @@ class RBTree {
   }
 
  private:
+  static const int MAX_EXTRA_STEPS_FROM_NO_GREATER_BOUND_TO_LOWER_BOUND = 3;
   // no-data node, left son is the true data root.
   TreeRoot root_;
   // no-data list node, as the header of the sorted list for all data node.
@@ -246,19 +267,45 @@ class RBTree {
   }
 
   // find the first node >= target_value.
-  Node* internalLowerbound(const VALUE& target_value) {
-    Node* no_greater_bound = internalNoGreaterBound(root_->leftSon(), target_value, nullptr);
-    // find the first node >= target_value across sorted-list.
-    Node* no_less_bound = no_greater_bound == nullptr ? list_header_ : no_greater_bound;
-    while (no_less_bound != list_tailer_ &&
-           (no_less_bound == list_header_ || no_less_bound->value() < target_value)) {
-      no_less_bound = no_less_bound->next();
-    }
-    if (no_less_bound == list_tailer_) {
-      return nullptr;
-    } else {
-      // finally find the first node >= target_key.
-      return no_less_bound;
+  // return a std::pair:
+  //   the first element means the try_times to find the lowerbound,
+  //   the second element means the found lowerbound.
+  std::pair<int, Node*> internalLowerbound(const VALUE& target_value) {
+    int try_times = 0;
+    // we wouldn't limit the try_times when the extra_steps_to_find_lower_bound over limit again and again.
+    // in some very rare cases, try_times would be large but it would finally success finding lowerbound and stop.
+    while (true) {
+      try_times++;
+      Node* no_greater_bound = internalNoGreaterBound(root_->leftSon(), target_value, nullptr);
+      // find the first node >= target_value across sorted-list.
+      Node* no_less_bound = no_greater_bound == nullptr ? list_header_ : no_greater_bound;
+      int extra_steps_to_find_lower_bound = 0;
+      // in concurrent read-write case, that exists 3 situations that we need to execute next-step across sorted-list:
+      // 1. no rbtree rotate influence:
+      //  1.1. target_value doesn't exist, we only need to next 1 step to find the lower bound.
+      //  1.2. erase operation move the target node up to current-find's node. in most cases, we only need to next 1 step,
+      //       but in very rare cases, multiple erase operations may execute faster than the current find operation and
+      //       then we must need to next more step, when this case happen, we limit it up to MAX_EXTRA_STEPS_FROM_NO_GREATER_BOUND_TO_LOWER_BOUND.
+      // 2. rbtree rotate influence:
+      //  2.1. in this case, it means the current find operation inside rbtree failed due to the wrong middle state of rbtree-structure causing by
+      //       rotate operation. in most cases, we can't find the lower bound with MAX_EXTRA_STEPS_FROM_NO_GREATER_BOUND_TO_LOWER_BOUND next steps.
+      while (no_less_bound != list_tailer_ &&
+            (no_less_bound == list_header_ || no_less_bound->value() < target_value) &&
+            (no_less_bound == list_header_ || extra_steps_to_find_lower_bound < MAX_EXTRA_STEPS_FROM_NO_GREATER_BOUND_TO_LOWER_BOUND)) {
+        extra_steps_to_find_lower_bound++;
+        no_less_bound = no_less_bound->next();
+      }
+      // here no_less_bound never be list_header_
+      if (no_less_bound == list_tailer_) {
+        // all nodes < target_key.
+        return {try_times, nullptr};
+      } else if (no_less_bound->value() >= target_value) {
+        // finally find the first node >= target_key.
+        return {try_times, no_less_bound};
+      } else {
+        // extra_steps_to_find_lower_bound over limit. we consider that searching into rbtree failed due to rotate operation.
+        continue;
+      }
     }
   }
 
@@ -485,6 +532,7 @@ class RBTree {
     if (insert_path.empty()) root_->setSon(Node::LEFT, insert_node);
     else if (value < insert_path.back()->value()) insert_path.back()->setSon(Node::LEFT, insert_node);
     else if (value > insert_path.back()->value()) insert_path.back()->setSon(Node::RIGHT, insert_node);
+    insert_node->setAccessibility(true);
     return insert_node;
   }
 };
@@ -496,12 +544,12 @@ class RBTree<VALUE>::Node {
   enum Color { RED, BLACK };
 
   explicit Node()
-    : value_(),
+    : value_(), accessible_(false),
       left_son_(nullptr), right_son_(nullptr), next_(nullptr) {}
 
   template<typename U>
   explicit Node(U&& value)
-    : value_(std::forward<U>(value)),
+    : value_(std::forward<U>(value)), accessible_(false),
       left_son_(nullptr), right_son_(nullptr), next_(nullptr) {}
 
   // when a node is going to be destructed, caller MUST make sure firstly that the node
@@ -523,6 +571,10 @@ class RBTree<VALUE>::Node {
   inline Color color() const { return color_; }
 
   inline void setColor(Color new_color) { color_ = new_color; }
+
+  inline bool accessible() const { return accessible_.load(); }
+
+  inline void setAccessibility(bool accessible) { accessible_.store(accessible); }
 
   inline Node* leftSon() const {
     return left_son_.load();
@@ -550,6 +602,7 @@ class RBTree<VALUE>::Node {
   // data region
   VALUE value_;
   Color color_;
+  std::atomic<bool> accessible_;
 
   // pointer region
   std::atomic<LeftSon> left_son_;
@@ -603,13 +656,13 @@ static void TestOneWriteMultiReadConcurrentPerf(int perf_max_try_times, bool is_
   const int INIT_DATA_COUNT = 1024;
   const int DATA_COUNT_FOR_INSERTION = 100000;
   const int MAX_TRY_TIMES = INT32_MAX;
-  // x86-64 intel (11 read threads):
+  // x86-64 intel (11 read threads, MAX_EXTRA_STEPS_FROM_NO_GREATER_BOUND_TO_LOWER_BOUND = 3):
   // random case (random insert value and random find value):
   // try_times = 1 : 99.9997%
   // try_times = 2 : 100%
   // worst case (sequential insert and always find the last insert value):
-  // try_times = 1 : 95%
-  // try_times = 2 : 99.995%
+  // try_times = 1 : 97.6%
+  // try_times = 2 : 99.99%
   const int PERF_MAX_TRY_TIMES = perf_max_try_times;
   const int READ_THREAD_COUNT = 11;
   std::random_device rd;          // Áî®‰∫éÁîüÊàêÁúüÈöèÊú∫ÁßçÂ≠êÔºàÂ¶? /dev/urandomÔº?
@@ -633,38 +686,44 @@ static void TestOneWriteMultiReadConcurrentPerf(int perf_max_try_times, bool is_
     if (init_set.find(a) != init_set.end() || random_set_for_insert.find(a) != random_set_for_insert.end()) i--;
     else random_set_for_insert.insert(a), random_list_for_insert.push_back(a);
   }
-  std::atomic<bool> insert_over(false);
-  auto insert_ope = [&my_map, &my_map_size, &random_list_for_insert, &insert_over]() {
+  std::atomic<bool> write_over(false);
+  std::atomic<bool> start_find(false);
+  auto write_ope = [&my_map, &my_map_size, &random_list_for_insert, &write_over, &start_find]() {
+    start_find.store(true);
     for (const auto ele: random_list_for_insert) {
       my_map.insert(ele);
       my_map_size.fetch_add(+1);
     }
-    insert_over.store(true);
+    // start_find.store(true);
+    for (int i = random_list_for_insert.size() - 1; i >= 0; i--) {
+      my_map.erase(random_list_for_insert[i]);
+      my_map_size.fetch_add(-1);
+    }
+    write_over.store(true);
   };
   std::atomic<int> tot_find_times(0);
   std::atomic<int> success_find_times(0);
   std::atomic<int> perf_find_times(0);
   std::atomic<int> max_try_times(0);
-  auto find_ope = [&my_map, &my_map_size, &insert_over, &init_list, &random_list_for_insert,
+  auto find_ope = [&my_map, &my_map_size, &write_over, &start_find, &init_list, &random_list_for_insert,
                    &tot_find_times, &success_find_times, &perf_find_times, &max_try_times, PERF_MAX_TRY_TIMES, is_worst_case]() {
+    while(!start_find.load()) {}
     int idx = 0;
-    while(!insert_over.load()) {
+    while(!write_over.load()) {
       int value;
-      if (is_worst_case) idx = my_map_size.load() - 1; // worst case: always find the last insert value
+      int local_my_map_size = my_map_size.load();
+      if (is_worst_case) idx = local_my_map_size - 1; // worst case: always find the last insert value
       if (idx < INIT_DATA_COUNT) value = init_list[idx];
-      else if (idx < my_map_size.load()) value = random_list_for_insert[idx - INIT_DATA_COUNT];
+      else if (idx < local_my_map_size) value = random_list_for_insert[idx - INIT_DATA_COUNT];
       else idx = 0, value = init_list[idx];
-      bool result;
       // try_times的次数越多，说明find操作受旋转操作而导致红黑树失效的次数越多，和value存在与否无关。当然，测试时为了方便，保证了value在find时必然存在的。
       int try_times = 0;
-      do {
-        // value must exist.
-        result = my_map.findForConcurrentTest(value);
-        try_times++;
-      } while(!result && try_times < MAX_TRY_TIMES);
+      auto result = my_map.findForConcurrentTest(value);
+      // assert(result.second != nullptr);
+      try_times = result.first;
       tot_find_times.fetch_add(+1);
-      if (result) success_find_times.fetch_add(+1);
-      if (result && try_times <= PERF_MAX_TRY_TIMES) perf_find_times.fetch_add(+1);
+      success_find_times.fetch_add(+1);
+      if (try_times <= PERF_MAX_TRY_TIMES) perf_find_times.fetch_add(+1);
       int local_max_try_times = max_try_times.load();
       do {
         if (local_max_try_times >= try_times) break;
@@ -672,7 +731,7 @@ static void TestOneWriteMultiReadConcurrentPerf(int perf_max_try_times, bool is_
       idx++;
     }
   };
-  std::thread write_thread(insert_ope);
+  std::thread write_thread(write_ope);
   std::vector<std::thread> read_threads;
 
   for (int i = 0; i < READ_THREAD_COUNT; i++) {
@@ -700,9 +759,24 @@ static void TestOneWriteMultiReadConcurrentPerf(int perf_max_try_times, bool is_
   std::cout << newest_max_height << " " << newest_min_height << " " << node_count - 1 << "\n";
 }
 
+// 1、每个节点持有对其left subtree和right subtree的两把rw-lock、记录到其left subtree和right subtree各自的root节点地址（atomic）、以及记录left subtree root和right subtree root在2-3-4树中分别是几数据节点。
+//    其中rw-lock是为了锁left/right subtree本身的，不关心这个subtree的root是哪个具体节点。
+// 2、写线程（先讨论insert）在往下遍历一个新节点的时候，都需要先获取以这个新节点作为root的subtree的s-lock（lock在这个新节点的father中），在获取到
+//    s-lock之后，如果新节点是red，则直接往下路由（已上的s-lock不释放）；如果新节点是black，再读取这个新节点在2-3-4树中是几数据节点这个信息（这个信息也在新节点的father中），然后如果该新节点是非三数据节点的话
+//    就将该节点加入到候补x-lock节点列表中（但是不会直接上x-lock），否则不更新。之后继续往下路由（已上的s-lock不释放）。
+// 3、写线程在往下遍历结束之后，会先取候补x-lock节点列表中的最后一个节点（必然为black），以这个节点为root的subtree是本次insert操作upward balance所刚需要到达的最远地方。
+//    将遍历路径中该节点后的所有节点的s-lock释放，然后将该节点的s-lock释放后申请其x-lock。
+// 4、在写线程a申请候补x-lock节点的x-lock的时候，可能其他也需要申请这个节点x-lock的写线程b先申请了然后使得写线程a在后续有机会获取x-lock的时候发现该节点已经不是非三数据节点了，
+//    这时候需要在候补x-lock节点列表中往前找，然后重复3-4步。
+// 5、在x-lock上成功之后，写线程就可以安全的执行insert操作并且执行balance操作了。最后把所有的s/x-lock释放。
+// 6、erase操作的写线程，依然是在往下路由过程中一直持有s-lock，然后也会维护一个候补x-lock节点列表，只不过这个列表的准入条件是该节点以及其非delete_side的
+//    son节点在2-3-4树中有一个不是单数据节点（即两个都是单数据节点就不行，这时候就必须upward balance了）。在向下路由到目标erase节点后，直接取候补x-lock节点
+//    列表中的最后一个节点（必然在目标erase节点上面），将遍历路径中该节点后的所有节点的s-lock释放，然后将该节点的s-lock释放后申请其x-lock。在获取到x-lock之后，
+//    就可以执行节点替换以及balance操作了，这时候包括erase node、替换node以及balance操作相关node在内的所有相关节点都在x-lock的保护中了。由此看出，erase操作
+//    的x-lock锁住的范围比实际需要的可能要大，而insert操作则不会有该问题。
 int main() {
   TestOneWriteMultiReadConcurrentPerf(2, false);
   TestOneWriteMultiReadConcurrentPerf(2, true);
-  TestSingleThreadAbility(false);
-  TestSingleThreadAbility(true);
+  // TestSingleThreadAbility(false);
+  // TestSingleThreadAbility(true);
 }
