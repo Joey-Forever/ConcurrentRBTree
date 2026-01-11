@@ -30,16 +30,21 @@ class RBTree {
 
  public:
   RBTree() {
+    // these three nodes are never accessible to the user of rbtree.
     root_ = new Node();
     list_header_ = new Node();
     list_tailer_ = new Node();
+    // 1. insert list_header_ and list_tailer_ into rbtree.
+    root_->setSon(Node::LEFT, list_header_);
+    list_header_->setSon(Node::RIGHT, list_tailer_);
+    list_header_->setColor(Node::BLACK);
+    list_tailer_->setColor(Node::RED);
+    // 2. insert list_header_ and list_tailer_ into sorted_list.
     list_header_->setNext(list_tailer_);
   }
 
   ~RBTree() {
     recursiveDestruction(root_);
-    delete list_header_;
-    delete list_tailer_;
   }
 
   // find the accessible node == value.
@@ -241,6 +246,8 @@ class RBTree {
   // no-data list node, as the tailer of the sorted list for all data node.
   ListTailer list_tailer_;
 
+  friend class Node;
+
   // recursive destruct a sub-tree whose root is curr_node.
   void recursiveDestruction(Node* curr_node) {
     if (curr_node == nullptr) {
@@ -255,6 +262,12 @@ class RBTree {
   Node* internalFind(Node* curr_node, const VALUE& target_value) {
     if (curr_node == nullptr) {
       return nullptr;
+    }
+    if (curr_node == list_header_) {
+      return internalFind(curr_node->rightSon(), target_value);
+    }
+    if (curr_node == list_tailer_) {
+      return internalFind(curr_node->leftSon(), target_value);
     }
     if (curr_node->value() == target_value) {
       // the curr_node exactly equals to target key.
@@ -314,6 +327,12 @@ class RBTree {
     if (curr_node == nullptr) {
       return newest_bound;
     }
+    if (curr_node == list_header_) {
+      return internalNoGreaterBound(curr_node->rightSon(), target_value, curr_node);
+    }
+    if (curr_node == list_tailer_) {
+      return internalNoGreaterBound(curr_node->leftSon(), target_value, newest_bound);
+    }
     if (curr_node->value() == target_value) {
       // the no-greater bound exactly equals to target key.
       return curr_node;
@@ -333,6 +352,12 @@ class RBTree {
       return true;
     }
     insert_path.push_back(curr_node);
+    if (curr_node == list_header_) {
+      return internalFindInsertPath(insert_value, curr_node->rightSon(), insert_path);
+    }
+    if (curr_node == list_tailer_) {
+      return internalFindInsertPath(insert_value, curr_node->leftSon(), insert_path);
+    }
     if (insert_value == curr_node->value()) {
       // insert_key exists, abort search.
       return false;
@@ -433,6 +458,9 @@ class RBTree {
     Node* pre_list_node = list_header_;
     const VALUE& target_value = target_leaf_node->value();
     for (Node* curr_node: tree_path) {
+      if (curr_node == list_header_ || curr_node == list_tailer_) {
+        continue;
+      }
       if (curr_node->value() < target_value && (pre_list_node == list_header_ || curr_node->value() > pre_list_node->value())) {
         pre_list_node = curr_node;
       }
@@ -530,12 +558,16 @@ class RBTree {
     pre_list_node->setNext(insert_node);
     // 2. insert node into rbtree.
     if (insert_path.empty()) root_->setSon(Node::LEFT, insert_node);
+    else if (insert_path.back() == list_tailer_) insert_path.back()->setSon(Node::LEFT, insert_node);
+    else if (insert_path.back() == list_header_) insert_path.back()->setSon(Node::RIGHT, insert_node);
     else if (value < insert_path.back()->value()) insert_path.back()->setSon(Node::LEFT, insert_node);
     else if (value > insert_path.back()->value()) insert_path.back()->setSon(Node::RIGHT, insert_node);
     insert_node->setAccessibility(true);
     return insert_node;
   }
 };
+
+static RBTree<int>* g_rbtree;
 
 template <typename VALUE>
 class RBTree<VALUE>::Node {
@@ -566,7 +598,10 @@ class RBTree<VALUE>::Node {
     }
   }
 
-  inline VALUE& value() { return value_; }
+  inline VALUE& value() {
+    assert(this != g_rbtree->list_header_ && this != g_rbtree->list_tailer_);
+    return value_;
+  }
 
   inline Color color() const { return color_; }
 
@@ -602,7 +637,7 @@ class RBTree<VALUE>::Node {
   // data region
   VALUE value_;
   Color color_;
-  std::atomic<bool> accessible_;
+  std::atomic<bool> accessible_; // whether the node is accessible to the user of rbtree.
 
   // pointer region
   std::atomic<LeftSon> left_son_;
@@ -614,6 +649,7 @@ static void TestSingleThreadAbility(bool sequential_insert) {
   std::cout << "------------------------------------------------------------------------------------------------" << "\n";
   std::cout << "single thread test (sequential_insert = " << (sequential_insert ? "true" : "false") << "):\n";
   RBTree<int> my_map;
+  g_rbtree = &my_map;
   int times = 100;
   std::deque<int> vec_for_map;
   int max_val = 0;
@@ -650,6 +686,7 @@ static void TestOneWriteMultiReadConcurrentPerf(int perf_max_try_times, bool is_
   std::cout << "------------------------------------------------------------------------------------------------" << "\n";
   std::cout << "concurrent test --- one write, multi read (perf_max_try_times = " << perf_max_try_times << ", is_worst_case = " << (is_worst_case ? "true" : "false") << "):\n";
   RBTree<int> my_map;
+  g_rbtree = &my_map;
   std::atomic<int> my_map_size(0);
   std::set<int> init_set, random_set_for_insert;
   std::vector<int> init_list, random_list_for_insert;
@@ -759,7 +796,7 @@ static void TestOneWriteMultiReadConcurrentPerf(int perf_max_try_times, bool is_
   std::cout << newest_max_height << " " << newest_min_height << " " << node_count - 1 << "\n";
 }
 
-// 1、每个节点持有对其left subtree和right subtree的两把rw-lock、记录到其left subtree和right subtree各自的root节点地址（atomic）、以及记录left subtree root和right subtree root在2-3-4树中分别是几数据节点。
+// 1、每个节点持有对其left subtree和right subtree的两把rw-lock、记录到其left subtree和right subtree各自的root节点地址（atomic）、以及记录left subtree root和right subtree root在2-3-4树中分别是几数据节点（red：0，black：1/2/3）。
 //    其中rw-lock是为了锁left/right subtree本身的，不关心这个subtree的root是哪个具体节点。
 // 2、写线程（先讨论insert）在往下遍历一个新节点的时候，都需要先获取以这个新节点作为root的subtree的s-lock（lock在这个新节点的father中），在获取到
 //    s-lock之后，如果新节点是red，则直接往下路由（已上的s-lock不释放）；如果新节点是black，再读取这个新节点在2-3-4树中是几数据节点这个信息（这个信息也在新节点的father中），然后如果该新节点是非三数据节点的话
@@ -767,16 +804,22 @@ static void TestOneWriteMultiReadConcurrentPerf(int perf_max_try_times, bool is_
 // 3、写线程在往下遍历结束之后，会先取候补x-lock节点列表中的最后一个节点（必然为black），以这个节点为root的subtree是本次insert操作upward balance所刚需要到达的最远地方。
 //    将遍历路径中该节点后的所有节点的s-lock释放，然后将该节点的s-lock释放后申请其x-lock。
 // 4、在写线程a申请候补x-lock节点的x-lock的时候，可能其他也需要申请这个节点x-lock的写线程b先申请了然后使得写线程a在后续有机会获取x-lock的时候发现该节点已经不是非三数据节点了，
-//    这时候需要在候补x-lock节点列表中往前找，然后重复3-4步。
+//    这时候需要在候补x-lock节点列表中往前找（由于写线程a会一直持有这些候补节点的s-lock，所以不需要担心中途有其他写线程修改这些候补节点为三数据节点），然后重复3-4步。
 // 5、在x-lock上成功之后，写线程就可以安全的执行insert操作并且执行balance操作了。最后把所有的s/x-lock释放。
 // 6、erase操作的写线程，依然是在往下路由过程中一直持有s-lock，然后也会维护一个候补x-lock节点列表，只不过这个列表的准入条件是该节点以及其非delete_side的
-//    son节点在2-3-4树中有一个不是单数据节点（即两个都是单数据节点就不行，这时候就必须upward balance了）。在向下路由到目标erase节点后，直接取候补x-lock节点
-//    列表中的最后一个节点（必然在目标erase节点上面），将遍历路径中该节点后的所有节点的s-lock释放，然后将该节点的s-lock释放后申请其x-lock。在获取到x-lock之后，
-//    就可以执行节点替换以及balance操作了，这时候包括erase node、替换node以及balance操作相关node在内的所有相关节点都在x-lock的保护中了。由此看出，erase操作
-//    的x-lock锁住的范围比实际需要的可能要大，而insert操作则不会有该问题。
+//    son节点在2-3-4树中有一个不是单数据节点（即两个都是单数据节点就不行，这时候就必须upward balance了），具体做法是，在路由到该节点获取到该节点的s-lock之后，
+//    先看下该节点是不是单数据节点，如果不是则直接将该节点加入候补列表然后继续往下路由，如果该节点是单数据节点，则要去获取其非delete_side的son节点c的s-lock，然后
+//    检查其son节点c是不是单数据节点，如果不是则在持有其son节点c的s-lock的情况下（防止后续其他erase写线程获取c的x-lock然后将其变成单数据节点）将该节点加入候补列表然后继续往下路由，
+//    如果其son节点c也是单数据节点，则将其son节点c的s-lock释放后继续往下路由（或许后续其son节点c会因为其他insert写线程的插入操作而变成非单数据节点，但这只是一个潜在的优化点，
+//    并不会使erase操作情况变差）。在向下路由到目标erase节点后，直接取候补x-lock节点列表中的最后一个节点（必然在目标erase节点上面），将遍历路径中该节点后的所有节点的s-lock释放，
+//    然后将该节点的s-lock释放后申请其x-lock。在获取到x-lock之后（当然，这时也可能会遇到insert写线程在第4点中可能遇到的类似情况，做出相应判断即可），就可以执行节点替换以及balance操作了，
+//    这时候包括erase node、替换node以及balance操作相关node在内的所有相关节点都在x-lock的保护中了。
+// 7、由此看出，erase操作的x-lock锁住的范围比实际需要的可能要大，而insert操作则不会有该问题。
+// 8、经验证，无论是insert写操作还是erase写操作，在写线程获取到rbtree上x-lock之后（注意必须是获取x-lock之后），erase_node/insert_node在sorted_list中的前继节点/后继节点既不会被删除也不会因为其他插入操作而变为新节点。
+//    如果在sorted_list主链中存在一个node是inaccessible的话，那么这个node一定是正在（持有x-lock时视为“正在”）被erase或正在被insert，也就是其直接前继/直接后继不会存在其他正在发生的insert/erase操作。
 int main() {
   TestOneWriteMultiReadConcurrentPerf(2, false);
   TestOneWriteMultiReadConcurrentPerf(2, true);
-  // TestSingleThreadAbility(false);
-  // TestSingleThreadAbility(true);
+  TestSingleThreadAbility(false);
+  TestSingleThreadAbility(true);
 }
