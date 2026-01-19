@@ -5,7 +5,7 @@
 #include <set>
 #include <chrono>
 #include <random>
-#include <shared_mutex>
+#include <mutex>
 #include <deque>
 #include <thread>
 #include <cassert>
@@ -19,6 +19,7 @@ class RBTree {
  public:
   class Node;
   typedef Node* TreeRoot;
+  typedef Node* Father;
   typedef Node* LeftSon;
   typedef Node* RightSon;
   typedef Node* ListHeader;
@@ -28,9 +29,11 @@ class RBTree {
   using Side = typename Node::Side;
   using Color = typename Node::Color;
 
+  enum WriteType { INSERT, ERASE };
+
  public:
   RBTree() {
-    // these three nodes are never accessible to the user of rbtree.
+    // root_ is never accessible to the user of rbtree.
     root_ = new Node();
     list_header_ = new Node();
     list_tailer_ = new Node();
@@ -41,6 +44,9 @@ class RBTree {
     list_tailer_->setColor(Node::RED);
     // 2. insert list_header_ and list_tailer_ into sorted_list.
     list_header_->setNext(list_tailer_);
+    // 3. make list_header_ and list_tailer_ accessible.
+    list_header_->setAccessibility(true);
+    list_tailer_->setAccessibility(true);
   }
 
   ~RBTree() {
@@ -93,58 +99,73 @@ class RBTree {
   // otherwise execute insertion firstly.
   template<typename U>
   Node* insert(U&& insert_value) {
-    std::vector<Node*> insert_path;
-    bool should_insert = internalFindInsertPath(insert_value, root_->leftSon(), insert_path);
+    bool should_insert;
+    Node* predecessor;
+    std::tie(should_insert, predecessor) = internalFindForWriteCase(insert_value, WriteType::INSERT);
     if (!should_insert) {
-      return insert_path.back();
+      return predecessor;
     }
     // insert_key doesn't exist, execute insertion.
 
-    Node* insert_node = createAndAttachLeafNode(std::forward<U>(insert_value), insert_path);
-    // execute upward balance across the insert_path.
-    balanceTheTreeAfterInsert(insert_node, insert_path);
+    Node* successor = predecessor->next();
+    Node* insert_node = new Node(std::forward<U>(insert_value));
+    insert_node->lock();
+    // 1. insert node into sorted list.
+    insert_node->setNext(successor);
+    predecessor->setNext(insert_node);
+    // 2. acquire lock before modifying rbtree's structure.
+    lockForModifyTreeStruct();
+    // 3. insert node into rbtree.
+    assert(predecessor->rightSon() == nullptr || successor->leftSon() == nullptr);
+    if (predecessor->rightSon() == nullptr) {
+      predecessor->setSon(Node::RIGHT, insert_node);
+    } else {
+      successor->setSon(Node::LEFT, insert_node);
+    }
+    // 4. set insert_node accessible after it's existed into sorted-list and rbtree.
+    insert_node->setAccessibility(true);
+    // 5. execute upward balance.
+    balanceTheTreeAfterInsert(insert_node);
+    // 6. finally release all locks.
+    unlockForModifyTreeStruct();
+    predecessor->unlock();
+    insert_node->unlock();
+    successor->unlock();
     return insert_node;
   }
 
   // return false if the erase_key doesn't exist.
   bool erase(const VALUE& erase_value) {
-    std::vector<Node*> erase_path;
-    bool should_erase = internalFindErasePath(erase_value, erase_path);
+    bool should_erase;
+    Node* predecessor;
+    std::tie(should_erase, predecessor) = internalFindForWriteCase(erase_value, WriteType::ERASE);
     if (!should_erase) {
       // erase_key doesn't exist, abort erase.
       return false;
     }
     // erase_key exists, execute erase.
 
-    Node* erase_node = erase_path.back();
+    lockForModifyTreeStruct();
+
+    Node* erase_node = predecessor->next();
     if (erase_node->leftSon() == nullptr && erase_node->rightSon() != nullptr) {
       // erase_node only has right son. And the right son must be a leaf node.
       // rotate left to make the erase_node to be a leaf node.
       Node* right_son = erase_node->rightSon();
-      rotateLeft(erase_node, erase_path.size() >= 2 ? erase_path[erase_path.size() - 2] : root_);
+      rotateLeft(erase_node, erase_node->father());
       Node::SwapColor(erase_node, right_son); // ! swap color to balance the tree
-      erase_path.pop_back();
-      erase_path.push_back(right_son);
-      erase_path.push_back(erase_node);
     }else if (erase_node->rightSon() == nullptr && erase_node->leftSon() != nullptr) {
       // erase_node only has left son. And the left son must be a leaf node.
       // rotate right to make the erase_node to be a leaf node.
       Node* left_son = erase_node->leftSon();
-      rotateRight(erase_node, erase_path.size() >= 2 ? erase_path[erase_path.size() - 2] : root_);
+      rotateRight(erase_node, erase_node->father());
       Node::SwapColor(erase_node, left_son); // ! swap color to balance the tree
-      erase_path.pop_back();
-      erase_path.push_back(left_son);
-      erase_path.push_back(erase_node);
     }
     // here the erase_node must be a leaf node or a non-leaf node with two son.
-    // And the erase_node is contained into erase_path too (e.g. erase_node = erase_path.back()).
     if (erase_node->leftSon() == nullptr && erase_node->rightSon() == nullptr) {
       // erase_node is a leaf node, erase directly.
 
-      erase_path.pop_back(); // pop the erase_node
-      Node* pre_list_node = findPreListNodeFromTreePath(erase_node, erase_path);
-      Node* father_of_erase_node = erase_path.empty() ? root_ : erase_path.back();
-      if (!erase_path.empty()) erase_path.pop_back(); // pop the father_of_erase_node
+      Node* father_of_erase_node = erase_node->father();
       // 1. make erase_node inaccessible.
       erase_node->setAccessibility(false);
       // 2. detach erase_node from rbtree but keep being attached into sorted-list.
@@ -153,52 +174,36 @@ class RBTree {
       // 3. upward balance the rbtree.
       if (erase_node->color() == Node::BLACK && father_of_erase_node != root_) {
         // ensure bro_of_delete_side must exist.
-        balanceTheTreeAfterErase(father_of_erase_node, delete_side, erase_path);
+        balanceTheTreeAfterErase(father_of_erase_node, delete_side);
       }
       // 4. detach erase_node from sorted-list.
-      pre_list_node->setNext(erase_node->next());
+      predecessor->setNext(erase_node->next());
       // 5. finally delete erase_node.
       // delete erase_node;
     } else {
       // erase_node is a non-leaf node with two son.
 
-      Node* father_of_erase_node = erase_path.size() < 2 ? root_ : erase_path[erase_path.size() - 2];
-      // push the path between erase_node and his pre-node(must be the right-most node of erase_node's left-subtree) into erase_path.
-      Node* curr_node = erase_node->leftSon();
-      while (curr_node != nullptr) {
-        erase_path.push_back(curr_node);
-        curr_node = curr_node->rightSon();
-      }
-      // here the erase_path.back() is the max(e.g. right most) node of the erase_node's left-subtree.
-      Node* right_most_node = erase_path.back();
+      Node* father_of_erase_node = erase_node->father();
+      // here right_most_node is the max(e.g. right most) node of the erase_node's left-subtree.
+      Node* right_most_node = predecessor;
       Node* left_son_of_right_most_node = right_most_node->leftSon();
       if (left_son_of_right_most_node != nullptr) {
         // rotate right to make the right-most node to be a leaf node.
-        rotateRight(right_most_node, erase_path[erase_path.size() - 2]); // right_most_node's father wouldn't be root_.
+        rotateRight(right_most_node, right_most_node->father()); // right_most_node's father wouldn't be root_.
         Node::SwapColor(right_most_node, left_son_of_right_most_node); // ! swap color to balance the tree
-        erase_path.pop_back();
-        erase_path.push_back(left_son_of_right_most_node);
-        erase_path.push_back(right_most_node);
       }
-      // here the erase_path.back() is the max and right-most and leaf node of the erase_node's left-subtree.
-      right_most_node = erase_path.back();
-      erase_path.pop_back(); // pop the right_most_node
-      Node* father_of_right_most_node = erase_path.back();
-      erase_path.pop_back(); // pop the father_of_right_most_node
+      // here right_most_node is the max and right-most and leaf node of the erase_node's left-subtree.
+      Node* father_of_right_most_node = right_most_node->father();
       // 1. detach right_most_node from rbtree but keep being attached into sorted-list.
       Side delete_side = father_of_right_most_node->setSon(
         father_of_right_most_node->leftSon() == right_most_node ? Node::LEFT : Node::RIGHT, nullptr);
       // 2. upward balance the rbtree.
       if (right_most_node->color() == Node::BLACK && father_of_right_most_node != root_) {
         // ensure bro_of_delete_side must exist.
-        balanceTheTreeAfterErase(father_of_right_most_node, delete_side, erase_path);
+        balanceTheTreeAfterErase(father_of_right_most_node, delete_side);
       }
       // 3. find the erase_node for removing.
-      erase_path.clear();
-      internalFindErasePath(erase_value, erase_path);
-      erase_node = erase_path.back();
-      erase_path.pop_back();
-      father_of_erase_node = erase_path.empty() ? root_ : erase_path.back();
+      father_of_erase_node = erase_node->father();
       // 4. make erase_node inaccessible.
       erase_node->setAccessibility(false);
       // 5. replace erase_node with right_most_node on erase_node's position in rbtree.
@@ -212,6 +217,10 @@ class RBTree {
       // 7. finally delete erase_node.
       // delete erase_node;
     }
+    // finally release all locks.
+    unlockForModifyTreeStruct();
+    predecessor->unlock();
+    erase_node->unlock();
     return true;
   }
 
@@ -245,8 +254,18 @@ class RBTree {
   ListHeader list_header_;
   // no-data list node, as the tailer of the sorted list for all data node.
   ListTailer list_tailer_;
+  // any write thread should firstly acquire this mutex before modifying rbtree's structure.
+  mutable std::mutex lock_for_modify_tree_struct_;
 
   friend class Node;
+
+  void lockForModifyTreeStruct() const {
+    lock_for_modify_tree_struct_.lock();
+  }
+
+  void unlockForModifyTreeStruct() const {
+    lock_for_modify_tree_struct_.unlock();
+  }
 
   // recursive destruct a sub-tree whose root is curr_node.
   void recursiveDestruction(Node* curr_node) {
@@ -344,6 +363,115 @@ class RBTree {
     return internalNoGreaterBound(curr_node->leftSon(), target_value, newest_bound);
   }
 
+  // return a std::pair:
+  //  the first element is true means we should execute write operation, and the second element would store the predecessor. (return *WITH* lock)
+  //  the first element is false means we should not execute write operation, and in insert case the second element is the existed node. (return *WITHOUT* lock)
+  std::pair<bool, Node*> internalFindForWriteCase(const VALUE& target_value, WriteType write_type) {
+    Node* predecessor_of_no_less_bound = list_header_;
+    Node* no_less_bound = list_header_;
+    while (true) {
+      // find the target_value from the rbtree, and record the less bound(the greatest node < target_value) inside the searching path at the same time.
+      Node* less_bound = list_header_;
+      Node* curr_node = root_->leftSon();
+      while(curr_node != nullptr) {
+        if (curr_node == list_header_) {
+          curr_node = curr_node->rightSon();
+        } else if (curr_node == list_tailer_) {
+          curr_node = curr_node->leftSon();
+        } else if (target_value < curr_node->value()) {
+          curr_node = curr_node->leftSon();
+        } else if (target_value > curr_node->value()) {
+          if (less_bound == list_header_ || curr_node->value() > less_bound->value()) less_bound = curr_node;
+          curr_node = curr_node->rightSon();
+        } else {
+          // curr_node's value == target_value.
+          break;
+        }
+      }
+      // here curr_node is nullptr or equals to target_value.
+      assert((curr_node == nullptr || curr_node->value() == target_value) &&
+             (less_bound == list_header_ || less_bound->value() < target_value));
+      Node* left_son_of_curr_node = curr_node == nullptr ? nullptr : curr_node->leftSon();
+      if (curr_node == nullptr || left_son_of_curr_node == nullptr) {
+        // find the first node >= target_value across sorted-list.
+        predecessor_of_no_less_bound = less_bound;
+        predecessor_of_no_less_bound->lock();
+        no_less_bound = predecessor_of_no_less_bound->next();
+        no_less_bound->lock();
+        int extra_steps_to_find_lower_bound = 0;
+        while (no_less_bound != list_tailer_ &&
+               no_less_bound->value() < target_value &&
+               extra_steps_to_find_lower_bound < MAX_EXTRA_STEPS_FROM_NO_GREATER_BOUND_TO_LOWER_BOUND) {
+          extra_steps_to_find_lower_bound++;
+          predecessor_of_no_less_bound->unlock();
+          predecessor_of_no_less_bound = no_less_bound;
+          // here curr thread could safely access the next node because it would never change due to insert/erase by other threads since no_less_bound is locked by curr thread.
+          no_less_bound = no_less_bound->next();
+          no_less_bound->lock();
+        }
+        // here no_less_bound never be list_header_
+        if ((no_less_bound == list_tailer_ || no_less_bound->value() >= target_value) && predecessor_of_no_less_bound->accessible() && no_less_bound->accessible()) {
+          // all nodes < target_key or finally find the first node >= target_key.
+          break;
+        } else {
+          // extra_steps_to_find_lower_bound over limit. we consider that searching into rbtree failed due to rotate operation.
+          predecessor_of_no_less_bound->unlock();
+          no_less_bound->unlock();
+          predecessor_of_no_less_bound = list_header_;
+          no_less_bound = list_header_;
+          continue;
+        }
+      } else {
+        // here target_value must equal to curr_node and predecessor must exist inside curr_node's left subtree.
+        curr_node = left_son_of_curr_node;
+        while (curr_node != nullptr) {
+          predecessor_of_no_less_bound = curr_node;
+          curr_node = curr_node->rightSon();
+        }
+        predecessor_of_no_less_bound->lock();
+        no_less_bound = predecessor_of_no_less_bound->next();
+        no_less_bound->lock();
+        if (no_less_bound != list_tailer_ && no_less_bound->value() == target_value && predecessor_of_no_less_bound->accessible() && no_less_bound->accessible()) {
+          break;
+        } else {
+          // here we consider that searching into rbtree failed due to rotate operation.
+          predecessor_of_no_less_bound->unlock();
+          no_less_bound->unlock();
+          predecessor_of_no_less_bound = list_header_;
+          no_less_bound = list_header_;
+          continue;
+        }
+      }
+    }
+    // ! here curr thread must lock predecessor_of_no_less_bound and no_less_bound, and both of them are accessible.
+    assert(predecessor_of_no_less_bound->next() == no_less_bound &&
+           (no_less_bound == list_tailer_ || no_less_bound->value() >= target_value) &&
+           predecessor_of_no_less_bound->accessible() && no_less_bound->accessible());
+    if (no_less_bound == list_tailer_ || no_less_bound->value() > target_value) {
+      // target_value does not exist.
+      if (write_type == INSERT) {
+        // return with locks.
+        return {true, predecessor_of_no_less_bound};
+      } else {
+        // abort erase, release all locks.
+        predecessor_of_no_less_bound->unlock();
+        no_less_bound->unlock();
+        return {false, nullptr};
+      }
+    } else {
+      // target_value exists.
+      if (write_type == INSERT) {
+        // abort insert, release all locks.
+        predecessor_of_no_less_bound->unlock();
+        no_less_bound->unlock();
+        return {false, no_less_bound};
+      } else {
+        // return with locks.
+        return {true, predecessor_of_no_less_bound};
+      }
+    }
+  }
+
   // return false if the insert_key exists, and the existed node would be stored into the vector back.
   // return true if the insert_key doesn't exist, and father of leaf-insert-position would be stored into the vector back.
   bool internalFindInsertPath(const VALUE& insert_value, Node* curr_node, std::vector<Node*>& insert_path) {
@@ -390,15 +518,14 @@ class RBTree {
     return Node::LEFT;
   }
 
-  // this method is a recursive method, and it would execute upward balance across the insert_path.
-  void balanceTheTreeAfterInsert(Node* insert_node, std::vector<Node*>& insert_path) {
-    if (insert_path.empty()) {
+  // this method is a recursive method.
+  void balanceTheTreeAfterInsert(Node* insert_node) {
+    Node* father = insert_node->father();
+    if (father == root_) {
       // the insertion finally causes height increasing.
       insert_node->setColor(Node::BLACK);
       return;
     }
-    Node* father = insert_path.back();
-    insert_path.pop_back();
     if (father->color() == Node::BLACK) {
       insert_node->setColor(Node::RED);
       return;
@@ -406,13 +533,12 @@ class RBTree {
     // father color is RED, conditions are more complex.
 
     // because faher's color is RED, so grand_father must exist and be BLACK.
-    Node* grand_father = insert_path.back();
-    insert_path.pop_back();
+    Node* grand_father = father->father();
     Node* uncle = getBro(father, grand_father);
     if (uncle == nullptr || uncle->color() == Node::BLACK) {
       Side side = makeTreeGenSameSide(insert_node, father, grand_father);
-      if (side == Node::LEFT) rotateRight(grand_father, insert_path.empty() ? root_ : insert_path.back());
-      else rotateLeft(grand_father, insert_path.empty() ? root_ : insert_path.back());
+      if (side == Node::LEFT) rotateRight(grand_father, grand_father->father());
+      else rotateLeft(grand_father, grand_father->father());
       return;
     }
     // uncle is RED too, which would cause upward balance.
@@ -420,7 +546,7 @@ class RBTree {
     father->setColor(Node::BLACK);
     uncle->setColor(Node::BLACK);
     // grand_father as the new insert node, execute upward balance.
-    return balanceTheTreeAfterInsert(grand_father, insert_path);
+    return balanceTheTreeAfterInsert(grand_father);
   }
 
   // rotate-right the subtree rooted on node.
@@ -478,12 +604,11 @@ class RBTree {
   }
 
   // recursive method. father_of_erase_node's delete_side-subtree has one node deleted.
-  // erase_path doesn't contain father_of_erase_node.
-  void balanceTheTreeAfterErase(Node* father_of_erase_node, Side delete_side, std::vector<Node*>& erase_path) {
+  void balanceTheTreeAfterErase(Node* father_of_erase_node, Side delete_side) {
     // delete_side's subtree must be null or rooted with a BLACK node.
     // bro_of_delete_side must exist.
     bool increased_height;
-    Node* grand_fa = erase_path.empty() ? root_ : erase_path.back();
+    Node* grand_fa = father_of_erase_node->father();
     Node* bro_of_delete_side = broOfDeleteSide(father_of_erase_node, delete_side);
     if (father_of_erase_node->color() == Node::BLACK && bro_of_delete_side->color() == Node::RED) {
       // 1. bro is RED.
@@ -509,12 +634,10 @@ class RBTree {
         (bro_of_delete_side->rightSon() == nullptr || bro_of_delete_side->rightSon()->color() == Node::BLACK)) {
       // bro can safely be colored with RED.
       bro_of_delete_side->setColor(Node::RED);
-      if (increased_height || erase_path.empty()) {
+      if (increased_height || grand_fa == root_) {
         return;
       } else {
-        Node* grand_fa = erase_path.back();
-        erase_path.pop_back();
-        return balanceTheTreeAfterErase(grand_fa, grand_fa->leftSon() == father_of_erase_node ? Node::LEFT : Node::RIGHT, erase_path);
+        return balanceTheTreeAfterErase(grand_fa, grand_fa->leftSon() == father_of_erase_node ? Node::LEFT : Node::RIGHT);
       }
     }
     // here either bro's left son or right son is RED (or both RED).
@@ -543,28 +666,6 @@ class RBTree {
     }
     return;
   }
-
-  // create a new insert_node, and then attach the node into sorted list and rbtree.
-  // caller MUST make sure the insert_key doesn't exist before insert.
-  // caller MUST make sure the insert_path includes from root to a leaf node and the leaf node
-  // stored into insert_path.back() would become the father of the new insert_node.
-  // return the new insert_node.
-  template<typename U>
-  Node* createAndAttachLeafNode(U&& value, const std::vector<Node*>& insert_path) {
-    Node* insert_node = new Node(std::forward<U>(value));
-    // 1. insert node into sorted list.
-    Node* pre_list_node = findPreListNodeFromTreePath(insert_node, insert_path);
-    insert_node->setNext(pre_list_node->next());
-    pre_list_node->setNext(insert_node);
-    // 2. insert node into rbtree.
-    if (insert_path.empty()) root_->setSon(Node::LEFT, insert_node);
-    else if (insert_path.back() == list_tailer_) insert_path.back()->setSon(Node::LEFT, insert_node);
-    else if (insert_path.back() == list_header_) insert_path.back()->setSon(Node::RIGHT, insert_node);
-    else if (value < insert_path.back()->value()) insert_path.back()->setSon(Node::LEFT, insert_node);
-    else if (value > insert_path.back()->value()) insert_path.back()->setSon(Node::RIGHT, insert_node);
-    insert_node->setAccessibility(true);
-    return insert_node;
-  }
 };
 
 static RBTree<int>* g_rbtree;
@@ -577,16 +678,19 @@ class RBTree<VALUE>::Node {
 
   explicit Node()
     : value_(), accessible_(false),
-      left_son_(nullptr), right_son_(nullptr), next_(nullptr) {}
+      father_(nullptr), left_son_(nullptr),
+      right_son_(nullptr), next_(nullptr) {}
 
   template<typename U>
   explicit Node(U&& value)
     : value_(std::forward<U>(value)), accessible_(false),
-      left_son_(nullptr), right_son_(nullptr), next_(nullptr) {}
+      father_(nullptr), left_son_(nullptr),
+      right_son_(nullptr), next_(nullptr) {}
 
   // when a node is going to be destructed, caller MUST make sure firstly that the node
   // is detached from rbtree and that the list-node is detached from sorted list.
   ~Node() {
+    father_.store(nullptr);
     left_son_.store(nullptr);
     right_son_.store(nullptr);
     next_.store(nullptr);
@@ -611,6 +715,26 @@ class RBTree<VALUE>::Node {
 
   inline void setAccessibility(bool accessible) { accessible_.store(accessible); }
 
+  inline void lock() const {
+    assert(!is_locked_);
+    is_locked_ = true;
+    mutex_.lock();
+  }
+
+  inline void unlock() const {
+    assert(is_locked_);
+    is_locked_ = false;
+    mutex_.unlock();
+  }
+
+  inline Node* father() const {
+    return father_.load();
+  }
+
+  // inline void setFather(Node* new_father) {
+  //   father_.store(new_father);
+  // }
+
   inline Node* leftSon() const {
     return left_son_.load();
   }
@@ -622,6 +746,12 @@ class RBTree<VALUE>::Node {
   inline Side setSon(Side side, Node* new_son) {
     if (side == LEFT) left_son_.store(new_son);
     else right_son_.store(new_son);
+    // ! In fact, when this node's son changes to new_son, new_son's father would change to this node too,
+    // ! so we could update new_son's father here and it's no need to define a public setFather method.
+    // ! we have no need to worry about old_son's new father, because when we insert it into rbtree again,
+    // ! its new_father would call setSon method and then set old_son's new father at the same time.
+    // ! *DO NOT* set old_son's father to nullptr !!!
+    if (new_son != nullptr) new_son->father_.store(this);
     return side;
   }
 
@@ -638,11 +768,15 @@ class RBTree<VALUE>::Node {
   VALUE value_;
   Color color_;
   std::atomic<bool> accessible_; // whether the node is accessible to the user of rbtree.
+  mutable std::mutex mutex_; // lock for sorted-list searching condition.
 
   // pointer region
+  std::atomic<Father> father_; // ! only used for write case's upward balance.
   std::atomic<LeftSon> left_son_;
   std::atomic<RightSon> right_son_;
   std::atomic<ListNext> next_;
+
+  mutable bool is_locked_ = false;
 };
 
 static void TestSingleThreadAbility(bool sequential_insert) {
