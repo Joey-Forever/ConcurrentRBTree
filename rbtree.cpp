@@ -55,7 +55,6 @@ class RBTree {
 
   // find the accessible node == value.
   Node* find(const VALUE& value) {
-    // return internalFind(root_->leftSon(), value);
     Node* lower_bound = internalLowerbound(value).second;
     if (lower_bound == nullptr || lower_bound->value() > value || !lower_bound->accessible()) {
       return nullptr;
@@ -277,27 +276,6 @@ class RBTree {
     delete curr_node;
   }
 
-  // find node == target_key.
-  Node* internalFind(Node* curr_node, const VALUE& target_value) {
-    if (curr_node == nullptr) {
-      return nullptr;
-    }
-    if (curr_node == list_header_) {
-      return internalFind(curr_node->rightSon(), target_value);
-    }
-    if (curr_node == list_tailer_) {
-      return internalFind(curr_node->leftSon(), target_value);
-    }
-    if (curr_node->value() == target_value) {
-      // the curr_node exactly equals to target key.
-      return curr_node;
-    } else if (curr_node->value() < target_value) {
-      return internalFind(curr_node->rightSon(), target_value);
-    }else {
-      return internalFind(curr_node->leftSon(), target_value);
-    }
-  }
-
   // find the first node >= target_value.
   // return a std::pair:
   //   the first element means the try_times to find the lowerbound,
@@ -472,29 +450,6 @@ class RBTree {
     }
   }
 
-  // return false if the insert_key exists, and the existed node would be stored into the vector back.
-  // return true if the insert_key doesn't exist, and father of leaf-insert-position would be stored into the vector back.
-  bool internalFindInsertPath(const VALUE& insert_value, Node* curr_node, std::vector<Node*>& insert_path) {
-    if (curr_node == nullptr) {
-      // finally find a leaf position to insert.
-      return true;
-    }
-    insert_path.push_back(curr_node);
-    if (curr_node == list_header_) {
-      return internalFindInsertPath(insert_value, curr_node->rightSon(), insert_path);
-    }
-    if (curr_node == list_tailer_) {
-      return internalFindInsertPath(insert_value, curr_node->leftSon(), insert_path);
-    }
-    if (insert_value == curr_node->value()) {
-      // insert_key exists, abort search.
-      return false;
-    } else if (insert_value < curr_node->value()) {
-      return internalFindInsertPath(insert_value, curr_node->leftSon(), insert_path);
-    }
-    return internalFindInsertPath(insert_value, curr_node->rightSon(), insert_path);
-  }
-
   inline Node* getBro(Node* my_self, Node* father) const {
     return father->leftSon() == my_self ? father->rightSon() : father->leftSon();
   }
@@ -574,28 +529,6 @@ class RBTree {
     right_son->setSon(Node::LEFT, node);
     father->setSon(father->leftSon() == node ? Node::LEFT : Node::RIGHT, right_son);
     return right_son;
-  }
-
-  // find the nearest list node whose key is less than target_key.
-  // caller MUST make sure the target_leaf_node is a LEAF node, otherwise the pre list node may not be inside tree_path.
-  // tree_path means the path from tree root to leaf target node.
-  // return value always be valid, and it equals to list_header_ if nobody is less than target_leaf_node.
-  Node* findPreListNodeFromTreePath(Node* target_leaf_node, const std::vector<Node*>& tree_path) {
-    Node* pre_list_node = list_header_;
-    const VALUE& target_value = target_leaf_node->value();
-    for (Node* curr_node: tree_path) {
-      if (curr_node == list_header_ || curr_node == list_tailer_) {
-        continue;
-      }
-      if (curr_node->value() < target_value && (pre_list_node == list_header_ || curr_node->value() > pre_list_node->value())) {
-        pre_list_node = curr_node;
-      }
-    }
-    return pre_list_node;
-  }
-
-  inline bool internalFindErasePath(const VALUE& erase_value, std::vector<Node*>& erase_path) {
-    return !internalFindInsertPath(erase_value, root_->leftSon(), erase_path);
   }
 
   inline Node* broOfDeleteSide(Node* father, Side delete_side) {
