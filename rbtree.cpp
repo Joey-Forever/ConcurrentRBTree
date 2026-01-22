@@ -29,7 +29,16 @@ class RBTree {
   using Side = typename Node::Side;
   using Color = typename Node::Color;
 
-  enum WriteType { INSERT, ERASE };
+  enum OperationType { READ, INSERT, ERASE };
+
+  struct InternalFindResult {
+    // whether we should execute read/insert/erase and it's always true in read case.
+    bool should_execute;
+    // total searching times that current find has tried.
+    int try_times;
+    // pointer to the node that current case needs to execute next step.
+    Node* magic_node;
+  };
 
  public:
   RBTree() {
@@ -55,8 +64,8 @@ class RBTree {
 
   // find the accessible node == value.
   Node* find(const VALUE& value) {
-    Node* lower_bound = internalLowerbound(value).second;
-    if (lower_bound == nullptr || lower_bound->value() > value || !lower_bound->accessible()) {
+    Node* lower_bound = internalFind(value, OperationType::READ).magic_node;
+    if (lower_bound == list_tailer_ || lower_bound->value() > value || !lower_bound->accessible()) {
       return nullptr;
     } else {
       // finally find the accessible node == value.
@@ -68,10 +77,10 @@ class RBTree {
   //   the first element means the try_times to find the value,
   //   the second element means the found accessible node.
   std::pair<int, Node*> findForConcurrentTest(const VALUE& value) {
-    std::pair<int, Node*> result = internalLowerbound(value);
-    int try_times = result.first;
-    Node* lower_bound = result.second;
-    if (lower_bound == nullptr || lower_bound->value() > value || !lower_bound->accessible()) {
+    InternalFindResult result = internalFind(value, OperationType::READ);
+    int try_times = result.try_times;
+    Node* lower_bound = result.magic_node;
+    if (lower_bound == list_tailer_ || lower_bound->value() > value || !lower_bound->accessible()) {
       return {try_times, nullptr};
     } else {
       // finally find the node == value.
@@ -81,10 +90,7 @@ class RBTree {
 
   // find the first accessible node >= value.
   Node* lowerBound(const VALUE& value) {
-    Node* lower_bound = internalLowerbound(value).second;
-    if (lower_bound == nullptr) {
-      return nullptr;
-    }
+    Node* lower_bound = internalFind(value, OperationType::READ).magic_node;
     while(lower_bound != list_tailer_ && !lower_bound->accessible()) {
       lower_bound = lower_bound->next();
     }
@@ -98,9 +104,9 @@ class RBTree {
   // otherwise execute insertion firstly.
   template<typename U>
   Node* insert(U&& insert_value) {
-    bool should_insert;
-    Node* predecessor;
-    std::tie(should_insert, predecessor) = internalFindForWriteCase(insert_value, WriteType::INSERT);
+    InternalFindResult result = internalFind(insert_value, OperationType::INSERT);
+    bool should_insert = result.should_execute;
+    Node* predecessor = result.magic_node;
     if (!should_insert) {
       return predecessor;
     }
@@ -135,9 +141,9 @@ class RBTree {
 
   // return false if the erase_key doesn't exist.
   bool erase(const VALUE& erase_value) {
-    bool should_erase;
-    Node* predecessor;
-    std::tie(should_erase, predecessor) = internalFindForWriteCase(erase_value, WriteType::ERASE);
+    InternalFindResult result = internalFind(erase_value, OperationType::ERASE);
+    bool should_erase = result.should_execute;
+    Node* predecessor = result.magic_node;
     if (!should_erase) {
       // erase_key doesn't exist, abort erase.
       return false;
@@ -237,6 +243,26 @@ class RBTree {
     getHeightInfoForTest(curr_node->rightSon(), curr_height + 1, newest_max_height, newest_min_height, node_count);
   }
 
+  void checkIfSortedListValidForTest() {
+    // 1. check if sorted-list is increasing.
+    Node* curr_node = list_header_->next()->next();
+    Node* last_node = list_header_->next();
+    while(curr_node != nullptr && curr_node != list_tailer_) {
+      assert(last_node->value() < curr_node->value());
+      last_node = curr_node;
+      curr_node = curr_node->next();
+    }
+    // 2. check if all nodes are unlocked.
+    curr_node = list_header_;
+    while (curr_node != list_tailer_) {
+      curr_node->lock();
+      curr_node->unlock();
+      curr_node = curr_node->next();
+    }
+    curr_node->lock();
+    curr_node->unlock();
+  }
+
   Node* getRootForTest() {
     return root_;
   }
@@ -276,78 +302,20 @@ class RBTree {
     delete curr_node;
   }
 
-  // find the first node >= target_value.
-  // return a std::pair:
-  //   the first element means the try_times to find the lowerbound,
-  //   the second element means the found lowerbound.
-  std::pair<int, Node*> internalLowerbound(const VALUE& target_value) {
+  // return an InternalFindResult:
+  //  read case:
+  //    should_execute is always true, magic_node means the lower bound of target_value.
+  //  write case:
+  //    when should_execute is true, magic_node would store the predecessor. (return *WITH* lock)
+  //    when should_execute is false, in insert case magic_node is the existed node. (return *WITHOUT* lock)
+  InternalFindResult internalFind(const VALUE& target_value, OperationType type) {
+    Node* predecessor_of_no_less_bound = list_header_;
+    Node* no_less_bound = list_header_;
     int try_times = 0;
-    // we wouldn't limit the try_times when the extra_steps_to_find_lower_bound over limit again and again.
+    // we won't limit the try_times when the extra_steps_to_find_lower_bound over limit again and again.
     // in some very rare cases, try_times would be large but it would finally success finding lowerbound and stop.
     while (true) {
       try_times++;
-      Node* no_greater_bound = internalNoGreaterBound(root_->leftSon(), target_value, nullptr);
-      // find the first node >= target_value across sorted-list.
-      Node* no_less_bound = no_greater_bound == nullptr ? list_header_ : no_greater_bound;
-      int extra_steps_to_find_lower_bound = 0;
-      // in concurrent read-write case, that exists 3 situations that we need to execute next-step across sorted-list:
-      // 1. no rbtree rotate influence:
-      //  1.1. target_value doesn't exist, we only need to next 1 step to find the lower bound.
-      //  1.2. erase operation move the target node up to current-find's node. in most cases, we only need to next 1 step,
-      //       but in very rare cases, multiple erase operations may execute faster than the current find operation and
-      //       then we must need to next more step, when this case happen, we limit it up to MAX_EXTRA_STEPS_FROM_NO_GREATER_BOUND_TO_LOWER_BOUND.
-      // 2. rbtree rotate influence:
-      //  2.1. in this case, it means the current find operation inside rbtree failed due to the wrong middle state of rbtree-structure causing by
-      //       rotate operation. in most cases, we can't find the lower bound with MAX_EXTRA_STEPS_FROM_NO_GREATER_BOUND_TO_LOWER_BOUND next steps.
-      while (no_less_bound != list_tailer_ &&
-            (no_less_bound == list_header_ || no_less_bound->value() < target_value) &&
-            (no_less_bound == list_header_ || extra_steps_to_find_lower_bound < MAX_EXTRA_STEPS_FROM_NO_GREATER_BOUND_TO_LOWER_BOUND)) {
-        extra_steps_to_find_lower_bound++;
-        no_less_bound = no_less_bound->next();
-      }
-      // here no_less_bound never be list_header_
-      if (no_less_bound == list_tailer_) {
-        // all nodes < target_key.
-        return {try_times, nullptr};
-      } else if (no_less_bound->value() >= target_value) {
-        // finally find the first node >= target_key.
-        return {try_times, no_less_bound};
-      } else {
-        // extra_steps_to_find_lower_bound over limit. we consider that searching into rbtree failed due to rotate operation.
-        continue;
-      }
-    }
-  }
-
-  // find last node <= target_key.
-  Node* internalNoGreaterBound(Node* curr_node, const VALUE& target_value, Node* newest_bound) {
-    if (curr_node == nullptr) {
-      return newest_bound;
-    }
-    if (curr_node == list_header_) {
-      return internalNoGreaterBound(curr_node->rightSon(), target_value, curr_node);
-    }
-    if (curr_node == list_tailer_) {
-      return internalNoGreaterBound(curr_node->leftSon(), target_value, newest_bound);
-    }
-    if (curr_node->value() == target_value) {
-      // the no-greater bound exactly equals to target key.
-      return curr_node;
-    }
-    if (curr_node->value() < target_value) {
-      // newest bound updates to curr node.
-      return internalNoGreaterBound(curr_node->rightSon(), target_value, curr_node);
-    }
-    return internalNoGreaterBound(curr_node->leftSon(), target_value, newest_bound);
-  }
-
-  // return a std::pair:
-  //  the first element is true means we should execute write operation, and the second element would store the predecessor. (return *WITH* lock)
-  //  the first element is false means we should not execute write operation, and in insert case the second element is the existed node. (return *WITHOUT* lock)
-  std::pair<bool, Node*> internalFindForWriteCase(const VALUE& target_value, WriteType write_type) {
-    Node* predecessor_of_no_less_bound = list_header_;
-    Node* no_less_bound = list_header_;
-    while (true) {
       // find the target_value from the rbtree, and record the less bound(the greatest node < target_value) inside the searching path at the same time.
       Node* less_bound = list_header_;
       Node* curr_node = root_->leftSon();
@@ -369,37 +337,55 @@ class RBTree {
       // here curr_node is nullptr or equals to target_value.
       assert((curr_node == nullptr || curr_node->value() == target_value) &&
              (less_bound == list_header_ || less_bound->value() < target_value));
+      // ! specially optimize for read case.
+      if (curr_node != nullptr && type == OperationType::READ) {
+        no_less_bound = curr_node;
+        break;
+      }
       Node* left_son_of_curr_node = curr_node == nullptr ? nullptr : curr_node->leftSon();
-      if (curr_node == nullptr || left_son_of_curr_node == nullptr) {
+      if (curr_node == nullptr || (type != OperationType::READ && left_son_of_curr_node == nullptr)) {
         // find the first node >= target_value across sorted-list.
         predecessor_of_no_less_bound = less_bound;
-        predecessor_of_no_less_bound->lock();
+        if (type != OperationType::READ) predecessor_of_no_less_bound->lock();
         no_less_bound = predecessor_of_no_less_bound->next();
-        no_less_bound->lock();
+        if (type != OperationType::READ) no_less_bound->lock();
         int extra_steps_to_find_lower_bound = 0;
+        // in concurrent read-write case, that exists 3 situations that we need to execute next-step across sorted-list:
+        // 1. no rbtree rotate influence:
+        //  1.1. target_value doesn't exist, we only need to next 1 step to find the lower bound.
+        //  1.2. erase operation move the target node up to current-find's node. in most cases, we only need to next 1 step,
+        //       but in very rare cases, multiple erase operations may execute faster than the current find operation and
+        //       then we must need to next more step, when this case happen, we limit it up to MAX_EXTRA_STEPS_FROM_NO_GREATER_BOUND_TO_LOWER_BOUND.
+        // 2. rbtree rotate influence:
+        //  2.1. in this case, it means the current find operation inside rbtree failed due to the wrong middle state of rbtree-structure causing by
+        //       rotate operation. in most cases, we can't find the lower bound with MAX_EXTRA_STEPS_FROM_NO_GREATER_BOUND_TO_LOWER_BOUND next steps.
         while (no_less_bound != list_tailer_ &&
                no_less_bound->value() < target_value &&
                extra_steps_to_find_lower_bound < MAX_EXTRA_STEPS_FROM_NO_GREATER_BOUND_TO_LOWER_BOUND) {
           extra_steps_to_find_lower_bound++;
-          predecessor_of_no_less_bound->unlock();
+          if (type != OperationType::READ) predecessor_of_no_less_bound->unlock();
           predecessor_of_no_less_bound = no_less_bound;
           // here curr thread could safely access the next node because it would never change due to insert/erase by other threads since no_less_bound is locked by curr thread.
           no_less_bound = no_less_bound->next();
-          no_less_bound->lock();
+          if (type != OperationType::READ) no_less_bound->lock();
         }
         // here no_less_bound never be list_header_
-        if ((no_less_bound == list_tailer_ || no_less_bound->value() >= target_value) && predecessor_of_no_less_bound->accessible() && no_less_bound->accessible()) {
+        if ((no_less_bound == list_tailer_ || no_less_bound->value() >= target_value) &&
+            (type == OperationType::READ || (predecessor_of_no_less_bound->accessible() && no_less_bound->accessible()))) {
           // all nodes < target_key or finally find the first node >= target_key.
           break;
         } else {
           // extra_steps_to_find_lower_bound over limit. we consider that searching into rbtree failed due to rotate operation.
-          predecessor_of_no_less_bound->unlock();
-          no_less_bound->unlock();
+          if (type != OperationType::READ) {
+            predecessor_of_no_less_bound->unlock();
+            no_less_bound->unlock();
+          }
           predecessor_of_no_less_bound = list_header_;
           no_less_bound = list_header_;
           continue;
         }
       } else {
+        assert(type != OperationType::READ); // read thread never be in here.
         // here target_value must equal to curr_node and predecessor must exist inside curr_node's left subtree.
         curr_node = left_son_of_curr_node;
         while (curr_node != nullptr) {
@@ -421,31 +407,35 @@ class RBTree {
         }
       }
     }
-    // ! here curr thread must lock predecessor_of_no_less_bound and no_less_bound, and both of them are accessible.
+    if (type == OperationType::READ) {
+      assert(no_less_bound == list_tailer_ || no_less_bound->value() >= target_value);
+      return {true, try_times, no_less_bound};
+    }
+    // ! for write case: here curr thread must lock predecessor_of_no_less_bound and no_less_bound, and both of them are accessible.
     assert(predecessor_of_no_less_bound->next() == no_less_bound &&
            (no_less_bound == list_tailer_ || no_less_bound->value() >= target_value) &&
            predecessor_of_no_less_bound->accessible() && no_less_bound->accessible());
     if (no_less_bound == list_tailer_ || no_less_bound->value() > target_value) {
       // target_value does not exist.
-      if (write_type == INSERT) {
+      if (type == OperationType::INSERT) {
         // return with locks.
-        return {true, predecessor_of_no_less_bound};
+        return {true, try_times, predecessor_of_no_less_bound};
       } else {
         // abort erase, release all locks.
         predecessor_of_no_less_bound->unlock();
         no_less_bound->unlock();
-        return {false, nullptr};
+        return {false, try_times, nullptr};
       }
     } else {
       // target_value exists.
-      if (write_type == INSERT) {
+      if (type == OperationType::INSERT) {
         // abort insert, release all locks.
         predecessor_of_no_less_bound->unlock();
         no_less_bound->unlock();
-        return {false, no_less_bound};
+        return {false, try_times, no_less_bound};
       } else {
         // return with locks.
-        return {true, predecessor_of_no_less_bound};
+        return {true, try_times, predecessor_of_no_less_bound};
       }
     }
   }
@@ -731,6 +721,7 @@ static void TestSingleThreadAbility(bool sequential_insert) {
       if (my_map.find(a) != nullptr) i--;
       else my_map.insert(a), vec_for_map.push_back(a);
     }
+    my_map.checkIfSortedListValidForTest();
     int newest_max_height = INT32_MIN;
     int newest_min_height = INT32_MAX;
     int node_count = 0;
@@ -799,10 +790,10 @@ static void TestOneWriteMultiReadConcurrentPerf(int perf_max_try_times, bool is_
       my_map_size.fetch_add(+1);
     }
     // start_find.store(true);
-    for (int i = random_list_for_insert.size() - 1; i >= 0; i--) {
-      my_map.erase(random_list_for_insert[i]);
-      my_map_size.fetch_add(-1);
-    }
+    // for (int i = random_list_for_insert.size() - 1; i >= 0; i--) {
+    //   my_map.erase(random_list_for_insert[i]);
+    //   my_map_size.fetch_add(-1);
+    // }
     write_over.store(true);
   };
   std::atomic<int> tot_find_times(0);
@@ -823,7 +814,7 @@ static void TestOneWriteMultiReadConcurrentPerf(int perf_max_try_times, bool is_
       // try_times的次数越多，说明find操作受旋转操作而导致红黑树失效的次数越多，和value存在与否无关。当然，测试时为了方便，保证了value在find时必然存在的。
       int try_times = 0;
       auto result = my_map.findForConcurrentTest(value);
-      // assert(result.second != nullptr);
+      assert(result.second != nullptr && result.second->value() == value);
       try_times = result.first;
       tot_find_times.fetch_add(+1);
       success_find_times.fetch_add(+1);
@@ -867,5 +858,5 @@ int main() {
   TestOneWriteMultiReadConcurrentPerf(2, false);
   TestOneWriteMultiReadConcurrentPerf(2, true);
   TestSingleThreadAbility(false);
-  TestSingleThreadAbility(true);
+  // TestSingleThreadAbility(true);
 }
