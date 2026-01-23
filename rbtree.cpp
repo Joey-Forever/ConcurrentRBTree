@@ -10,6 +10,17 @@
 #include <thread>
 #include <cassert>
 
+#ifdef DEBUG
+    #define RB_ASSERT(condition) \
+        do { \
+            if (!(condition)) { \
+                assert(condition); \
+            } \
+        } while (false)
+#else
+    #define RB_ASSERT(condition) do { } while (false)
+#endif
+
 // single thread rbtree.
 // type KEY must implement operator< and operator==.
 // type KEY and type VALUE must define default constructor.
@@ -121,7 +132,7 @@ class RBTree {
     // 2. acquire lock before modifying rbtree's structure.
     lockForModifyTreeStruct();
     // 3. insert node into rbtree.
-    assert(predecessor->rightSon() == nullptr || successor->leftSon() == nullptr);
+    RB_ASSERT(predecessor->rightSon() == nullptr || successor->leftSon() == nullptr);
     if (predecessor->rightSon() == nullptr) {
       predecessor->setSon(Node::RIGHT, insert_node);
     } else {
@@ -248,7 +259,7 @@ class RBTree {
     Node* curr_node = list_header_->next()->next();
     Node* last_node = list_header_->next();
     while(curr_node != nullptr && curr_node != list_tailer_) {
-      assert(last_node->value() < curr_node->value());
+      RB_ASSERT(last_node->value() < curr_node->value());
       last_node = curr_node;
       curr_node = curr_node->next();
     }
@@ -335,7 +346,7 @@ class RBTree {
         }
       }
       // here curr_node is nullptr or equals to target_value.
-      assert((curr_node == nullptr || curr_node->value() == target_value) &&
+      RB_ASSERT((curr_node == nullptr || curr_node->value() == target_value) &&
              (less_bound == list_header_ || less_bound->value() < target_value));
       // ! specially optimize for read case.
       if (curr_node != nullptr && type == OperationType::READ) {
@@ -385,7 +396,7 @@ class RBTree {
           continue;
         }
       } else {
-        assert(type != OperationType::READ); // read thread never be in here.
+        RB_ASSERT(type != OperationType::READ); // read thread never be in here.
         // here target_value must equal to curr_node and predecessor must exist inside curr_node's left subtree.
         curr_node = left_son_of_curr_node;
         while (curr_node != nullptr) {
@@ -408,11 +419,11 @@ class RBTree {
       }
     }
     if (type == OperationType::READ) {
-      assert(no_less_bound == list_tailer_ || no_less_bound->value() >= target_value);
+      RB_ASSERT(no_less_bound == list_tailer_ || no_less_bound->value() >= target_value);
       return {true, try_times, no_less_bound};
     }
     // ! for write case: here curr thread must lock predecessor_of_no_less_bound and no_less_bound, and both of them are accessible.
-    assert(predecessor_of_no_less_bound->next() == no_less_bound &&
+    RB_ASSERT(predecessor_of_no_less_bound->next() == no_less_bound &&
            (no_less_bound == list_tailer_ || no_less_bound->value() >= target_value) &&
            predecessor_of_no_less_bound->accessible() && no_less_bound->accessible());
     if (no_less_bound == list_tailer_ || no_less_bound->value() > target_value) {
@@ -626,7 +637,7 @@ class RBTree<VALUE>::Node {
   }
 
   inline VALUE& value() {
-    assert(this != g_rbtree->list_header_ && this != g_rbtree->list_tailer_);
+    RB_ASSERT(this != g_rbtree->list_header_ && this != g_rbtree->list_tailer_);
     return value_;
   }
 
@@ -639,13 +650,13 @@ class RBTree<VALUE>::Node {
   inline void setAccessibility(bool accessible) { accessible_.store(accessible); }
 
   inline void lock() const {
-    assert(!is_locked_);
+    RB_ASSERT(!is_locked_);
     is_locked_ = true;
     mutex_.lock();
   }
 
   inline void unlock() const {
-    assert(is_locked_);
+    RB_ASSERT(is_locked_);
     is_locked_ = false;
     mutex_.unlock();
   }
@@ -814,7 +825,7 @@ static void TestOneWriteMultiReadConcurrentPerf(int perf_max_try_times, bool is_
       // try_times的次数越多，说明find操作受旋转操作而导致红黑树失效的次数越多，和value存在与否无关。当然，测试时为了方便，保证了value在find时必然存在的。
       int try_times = 0;
       auto result = my_map.findForConcurrentTest(value);
-      assert(result.second != nullptr && result.second->value() == value);
+      RB_ASSERT(result.second != nullptr && result.second->value() == value);
       try_times = result.first;
       tot_find_times.fetch_add(+1);
       success_find_times.fetch_add(+1);
@@ -855,6 +866,7 @@ static void TestOneWriteMultiReadConcurrentPerf(int perf_max_try_times, bool is_
 }
 
 int main() {
+  // RB_ASSERT(false);
   TestOneWriteMultiReadConcurrentPerf(2, false);
   TestOneWriteMultiReadConcurrentPerf(2, true);
   TestSingleThreadAbility(false);
