@@ -12,11 +12,7 @@
 
 #ifdef DEBUG
     #define RB_ASSERT(condition) \
-        do { \
-            if (!(condition)) { \
-                assert(condition); \
-            } \
-        } while (false)
+        do { assert(condition); } while (false)
 #else
     #define RB_ASSERT(condition) do { } while (false)
 #endif
@@ -650,14 +646,10 @@ class RBTree<VALUE>::Node {
   inline void setAccessibility(bool accessible) { accessible_.store(accessible); }
 
   inline void lock() const {
-    RB_ASSERT(!is_locked_);
-    is_locked_ = true;
     mutex_.lock();
   }
 
   inline void unlock() const {
-    RB_ASSERT(is_locked_);
-    is_locked_ = false;
     mutex_.unlock();
   }
 
@@ -710,7 +702,6 @@ class RBTree<VALUE>::Node {
   std::atomic<RightSon> right_son_;
   std::atomic<ListNext> next_;
 
-  mutable bool is_locked_ = false;
 };
 
 static void TestSingleThreadAbility(bool sequential_insert) {
@@ -865,10 +856,101 @@ static void TestOneWriteMultiReadConcurrentPerf(int perf_max_try_times, bool is_
   std::cout << newest_max_height << " " << newest_min_height << " " << node_count - 1 << "\n";
 }
 
+static void TestMultiWriteConcurrentPerf() {
+  std::cout << "------------------------------------------------------------------------------------------------" << "\n";
+  std::cout << "concurrent test --- multi write" << "\n";
+  RBTree<int> my_map;
+  g_rbtree = &my_map;
+
+  const int WRITE_THREAD_COUNT = 5;
+  const int BATCH_SIZE_PER_THREAD = 1000;
+  const int ELEMENT_SIZE_PER_BATCH = 1000;
+  std::random_device rd;          // Áî®‰∫éÁîüÊàêÁúüÈöèÊú∫ÁßçÂ≠êÔºàÂ¶? /dev/urandomÔº?
+  std::mt19937 gen(rd());         // ‰ΩøÁî®Ê¢ÖÊ£ÆÊóãËΩ¨ÁÆóÊ≥ï‰Ωú‰∏∫ÂºïÊìé
+  std::uniform_int_distribution<> dis(INT32_MIN, INT32_MAX); // ÁîüÊàê [1, 100] ÁöÑÂùáÂåÄÊï¥Êï∞
+  int value = 0;
+  auto gen_value = [&gen, &dis, &value]() -> int {
+    int a;
+    a = dis(gen);
+    return a;
+  };
+  std::set<int> total_eles;
+  auto gen_a_batch = [&total_eles, &gen_value, ELEMENT_SIZE_PER_BATCH]() -> std::vector<int> {
+    std::vector<int> vec;
+    for (int i = 0; i < ELEMENT_SIZE_PER_BATCH; i++) {
+      int a = gen_value();
+      if (total_eles.find(a) != total_eles.end()) i--;
+      else vec.push_back(a), total_eles.insert(a);
+    }
+    return vec;
+  };
+  auto gen_a_thread_data = [&gen_a_batch, BATCH_SIZE_PER_THREAD]() -> std::vector<std::vector<int>> {
+    std::vector<std::vector<int>> vec;
+    for (int i = 0; i < BATCH_SIZE_PER_THREAD; i++) {
+      vec.push_back(gen_a_batch());
+    }
+    return vec;
+  };
+  std::vector<std::vector<std::vector<int>>> thread_datas;
+  for (int i = 0; i < WRITE_THREAD_COUNT; i++) {
+    thread_datas.push_back(gen_a_thread_data());
+  }
+  std::atomic<int> thread_idx(0);
+  auto write_ope = [&my_map, &thread_idx, &thread_datas]() {
+    int idx = thread_idx.fetch_add(+1);
+    RB_ASSERT(idx < thread_datas.size());
+    const std::vector<std::vector<int>>& my_data = thread_datas[idx];
+    for (int i = 0; i < my_data.size(); i++) {
+      const std::vector<int>& batch_data = my_data[i];
+      // 1. insert the batch data.
+      for (int ele: batch_data) {
+        my_map.insert(ele);
+      }
+      // 2. find the insert batch data.
+      for (int ele: batch_data) {
+        auto result = my_map.findForConcurrentTest(ele);
+        RB_ASSERT(result.second != nullptr && result.second->value() == ele);
+      }
+      // 3. erase 1 batch every 2 batches.
+      if (i % 2 != 0) {
+        for (int ele: batch_data) {
+          my_map.erase(ele);
+        }
+        // find again.
+        for (int ele: batch_data) {
+          auto result = my_map.findForConcurrentTest(ele);
+          RB_ASSERT(result.second == nullptr);
+        }
+      }
+    }
+  };
+  std::vector<std::thread> write_threads;
+
+  auto t1 = std::chrono::high_resolution_clock::now();
+  for (int i = 0; i < WRITE_THREAD_COUNT; i++) {
+    write_threads.emplace_back(write_ope);
+  }
+
+  for (auto& t : write_threads) {
+    t.join();
+  }
+  auto t2 = std::chrono::high_resolution_clock::now();
+  int time = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+  std::cout << "thread count = " << WRITE_THREAD_COUNT << ", total time = " << time << " ms, time per thread = " << time * 1.0 / WRITE_THREAD_COUNT << " ms."<< "\n";
+
+  my_map.checkIfSortedListValidForTest();
+  int newest_max_height = INT32_MIN;
+  int newest_min_height = INT32_MAX;
+  int node_count = 0;
+  my_map.getHeightInfoForTest(my_map.getRootForTest(), 0, newest_max_height, newest_min_height, node_count);
+  std::cout << newest_max_height << " " << newest_min_height << " " << node_count - 1 << "\n";
+}
+
 int main() {
   // RB_ASSERT(false);
-  TestOneWriteMultiReadConcurrentPerf(2, false);
-  TestOneWriteMultiReadConcurrentPerf(2, true);
-  TestSingleThreadAbility(false);
+  // TestOneWriteMultiReadConcurrentPerf(2, false);
+  // TestOneWriteMultiReadConcurrentPerf(2, true);
+  // TestSingleThreadAbility(false);
   // TestSingleThreadAbility(true);
+  TestMultiWriteConcurrentPerf();
 }
