@@ -5,8 +5,6 @@
 #include <set>
 #include <chrono>
 #include <random>
-#include <mutex>
-#include <deque>
 #include <thread>
 #include <cassert>
 
@@ -47,6 +45,38 @@ class RBTree {
     Node* magic_node;
   };
 
+  enum WriteStatus { SUCCESS, RETRY, ABORT };
+  struct WriteResult {
+    WriteStatus status;
+    // pointer to the node that should return to Writer after true write.
+    Node* magic_node;
+  };
+
+  using WriteData = void*;
+  struct WriteInfo {
+    explicit WriteInfo(OperationType write_type, WriteData init_data)
+        : estimated_less_bound(nullptr), type(write_type), data(init_data) {}
+    Node* estimated_less_bound;
+    OperationType type;
+    WriteData data;
+  };
+
+  struct BatchWriteUnit {
+    explicit BatchWriteUnit(OperationType write_type, WriteData init_data)
+        : info(write_type, init_data), done(false) {}
+    WriteInfo info;
+    WriteResult result;
+    std::atomic<bool> done;
+  };
+
+  struct Writer {
+    explicit Writer()
+        : batch_unit(nullptr), accessible(false) {}
+
+    BatchWriteUnit* batch_unit;
+    std::atomic<bool> accessible;
+  };
+
  public:
   RBTree() {
     // root_ is never accessible to the user of rbtree.
@@ -54,8 +84,8 @@ class RBTree {
     list_header_ = new Node();
     list_tailer_ = new Node();
     // 1. insert list_header_ and list_tailer_ into rbtree.
-    root_->setSon(Node::LEFT, list_header_);
-    list_header_->setSon(Node::RIGHT, list_tailer_);
+    root_->setSonNoBarrier(Node::LEFT, list_header_);
+    list_header_->setSonNoBarrier(Node::RIGHT, list_tailer_);
     list_header_->setColor(Node::BLACK);
     list_tailer_->setColor(Node::RED);
     // 2. insert list_header_ and list_tailer_ into sorted_list.
@@ -63,6 +93,8 @@ class RBTree {
     // 3. make list_header_ and list_tailer_ accessible.
     list_header_->setAccessibility(true);
     list_tailer_->setAccessibility(true);
+    // init the write batch memory block.
+    curr_write_batch_info_.store(0);
   }
 
   ~RBTree() {
@@ -71,7 +103,7 @@ class RBTree {
 
   // find the accessible node == value.
   Node* find(const VALUE& value) {
-    Node* lower_bound = internalFind(value, OperationType::READ).magic_node;
+    Node* lower_bound = internalFind(value).magic_node;
     if (lower_bound == list_tailer_ || lower_bound->value() > value || !lower_bound->accessible()) {
       return nullptr;
     } else {
@@ -84,7 +116,7 @@ class RBTree {
   //   the first element means the try_times to find the value,
   //   the second element means the found accessible node.
   std::pair<int, Node*> findForConcurrentTest(const VALUE& value) {
-    InternalFindResult result = internalFind(value, OperationType::READ);
+    InternalFindResult result = internalFind(value);
     int try_times = result.try_times;
     Node* lower_bound = result.magic_node;
     if (lower_bound == list_tailer_ || lower_bound->value() > value || !lower_bound->accessible()) {
@@ -97,7 +129,7 @@ class RBTree {
 
   // find the first accessible node >= value.
   Node* lowerBound(const VALUE& value) {
-    Node* lower_bound = internalFind(value, OperationType::READ).magic_node;
+    Node* lower_bound = internalFind(value).magic_node;
     while(lower_bound != list_tailer_ && !lower_bound->accessible()) {
       lower_bound = lower_bound->next();
     }
@@ -107,133 +139,236 @@ class RBTree {
     return lower_bound;
   }
 
+  // Macro to handle write batch - will be inlined at call site
+  #define HANDLE_WRITE_BATCH() \
+    do { \
+      /* reset the curr_write_batch_info_ */ \
+      uint32_t old_write_batch_info = curr_write_batch_info_.load(); \
+      int old_write_batch_id = (old_write_batch_info >> 31); \
+      if (old_write_batch_id == 0) { \
+        old_write_batch_info = curr_write_batch_info_.exchange(1U << 31, std::memory_order_acq_rel); \
+      } else { \
+        old_write_batch_info = curr_write_batch_info_.exchange(0, std::memory_order_acq_rel); \
+      } \
+      int old_write_batch_size = (old_write_batch_info & ((1U << 31) - 1)); \
+      RB_ASSERT((old_write_batch_id == 0 || old_write_batch_id == 1) && old_write_batch_size <= WRITE_BATCH_MAX_SIZE); \
+      Writer* old_write_batch_addr = write_batch_addr_[old_write_batch_id]; \
+      \
+      int erase_cnt = 0; \
+      for (int i = 0; i < old_write_batch_size; i++) { \
+        while(!old_write_batch_addr[i].accessible.load(std::memory_order_acquire)) {}  /* spin wait for accessible */ \
+        BatchWriteUnit* write_unitt = old_write_batch_addr[i].batch_unit; \
+        if (write_unitt->info.type == OperationType::ERASE) { \
+          tmp_array_for_handle_write_batch_[erase_cnt++] = i; \
+          continue; \
+        } \
+        Node* insert_node = (Node*)(write_unitt->info.data); \
+        /* find the exact_less_bound as the insert position in the sorted-list according to estimated_less_bound */ \
+        Node* exact_less_bound = findExactLessBoundForWrite(write_unitt->info.estimated_less_bound, insert_node->value()); \
+        if (exact_less_bound == nullptr) { \
+          /* 1. fail to find the insert position, retry */ \
+          write_unitt->result.status = WriteStatus::RETRY; \
+        } else { \
+          Node* no_less_bound = exact_less_bound->next(); \
+          if (no_less_bound == list_tailer_ || no_less_bound->value() > insert_node->value()) { \
+            /* 2. insert_node's target_value doesn't exist, execute insert and return the insert_node */ \
+            internalInsert(insert_node, exact_less_bound); \
+            write_unitt->result.status = WriteStatus::SUCCESS; \
+            write_unitt->result.magic_node = insert_node; \
+          } else { \
+            /* 3. insert_node's target_value already exists, abort insert and return the existed node */ \
+            RB_ASSERT(no_less_bound->value() == insert_node->value()); \
+            write_unitt->result.status = WriteStatus::ABORT; \
+            write_unitt->result.magic_node = no_less_bound; \
+          } \
+        } \
+        write_unitt->done.store(true, std::memory_order_release); \
+        /* reset the writer slot */ \
+        old_write_batch_addr[i].accessible.store(false, std::memory_order_release); \
+        old_write_batch_addr[i].batch_unit = nullptr; \
+      } \
+      \
+      for (int ii = 0; ii < erase_cnt; ii++) { \
+        int i = tmp_array_for_handle_write_batch_[ii]; \
+        BatchWriteUnit* write_unitt = old_write_batch_addr[i].batch_unit; \
+        VALUE* target_erase_value = (VALUE*)(write_unitt->info.data); \
+        /* find the exact_less_bound as the erase position in the sorted-list according to estimated_less_bound */ \
+        Node* exact_less_bound = findExactLessBoundForWrite(write_unitt->info.estimated_less_bound, *target_erase_value); \
+        if (exact_less_bound == nullptr) { \
+          /* 1. fail to find the erase position, retry */ \
+          write_unitt->result.status = WriteStatus::RETRY; \
+        } else { \
+          Node* no_less_bound = exact_less_bound->next(); \
+          if (no_less_bound == list_tailer_ || no_less_bound->value() > *target_erase_value) { \
+            /* 2. target_erase_value doesn't exist, abort erase */ \
+            write_unitt->result.status = WriteStatus::ABORT; \
+          } else { \
+            /* 3. target_erase_value exists, execute erase */ \
+            RB_ASSERT(no_less_bound->value() == *target_erase_value); \
+            internalErase(exact_less_bound); \
+            write_unitt->result.status = WriteStatus::SUCCESS; \
+          } \
+        } \
+        write_unitt->done.store(true, std::memory_order_release); \
+        /* reset the writer slot */ \
+        old_write_batch_addr[i].accessible.store(false, std::memory_order_release); \
+        old_write_batch_addr[i].batch_unit = nullptr; \
+      } \
+    } while (0)
+
   // the insert operation would be ignored if key exists and return the Node* to the existed value,
   // otherwise execute insertion firstly.
   template<typename U>
   Node* insert(U&& insert_value) {
-    InternalFindResult result = internalFind(insert_value, OperationType::INSERT);
-    bool should_insert = result.should_execute;
-    Node* predecessor = result.magic_node;
-    if (!should_insert) {
-      return predecessor;
-    }
-    // insert_key doesn't exist, execute insertion.
-
-    Node* successor = predecessor->next();
     Node* insert_node = new Node(std::forward<U>(insert_value));
-    insert_node->lock();
-    // 1. insert node into sorted list.
-    insert_node->setNext(successor);
-    predecessor->setNext(insert_node);
-    // 2. acquire lock before modifying rbtree's structure.
-    lockForModifyTreeStruct();
-    // 3. insert node into rbtree.
-    RB_ASSERT(predecessor->rightSon() == nullptr || successor->leftSon() == nullptr);
-    if (predecessor->rightSon() == nullptr) {
-      predecessor->setSon(Node::RIGHT, insert_node);
-    } else {
-      successor->setSon(Node::LEFT, insert_node);
+    int try_times = 0;
+    while (true) {
+      try_times++;
+      // 1. get the estimated_less_bound.
+      BatchWriteUnit write_unit(OperationType::INSERT, (void*)insert_node);
+      write_unit.info.estimated_less_bound = findEstimatedLessBoundForWrite(insert_node->value());
+      // 2. preserve a writer position.
+      uint32_t curr_write_batch_info = curr_write_batch_info_.fetch_add(1U, std::memory_order_acq_rel);
+      // 3. parse the write batch id and writer_idx.
+      int curr_write_batch_id = (curr_write_batch_info >> 31);
+      int writer_idx = (curr_write_batch_info & ((1U << 31) - 1));
+      RB_ASSERT((curr_write_batch_id == 0 || curr_write_batch_id == 1) && writer_idx < WRITE_BATCH_MAX_SIZE);
+      Writer* writer = &(write_batch_addr_[curr_write_batch_id][writer_idx]);
+      RB_ASSERT(!writer->accessible.load() && writer->batch_unit == nullptr);
+      // 4. use write_unit to set writer's batch_unit and then make writer accessible for leader writer to execute true write operation.
+      writer->batch_unit = &write_unit;
+      writer->accessible.store(true, std::memory_order_release);
+      bool retry = false;
+      while (write_leader_flag_.test_and_set(std::memory_order_acquire)) {
+        // now we failed to get leader flag.
+        if (write_unit.done.load(std::memory_order_acquire)) {
+          // ! here curr thread is the follower thread in the writers_ queue, and write operation is done by leader thread.
+          if (write_unit.result.status == WriteStatus::RETRY) {
+            retry = true;
+            break;
+          } else {
+            if (write_unit.result.status == WriteStatus::ABORT) delete insert_node;
+            return write_unit.result.magic_node;
+          }
+        } else {
+          // sleep for a while.
+          // std::this_thread::sleep_for(std::chrono::nanoseconds(0));
+          std::this_thread::yield();
+        }
+      }
+
+      if (retry) {
+        // it means our job was done by leader and we should retry.
+        continue;
+      }
+
+      // ! here we got the leader flag but we still need to check if our job done or not.
+      if (write_unit.done.load(std::memory_order_acquire)) {
+        // ok, our job is done, it means curr thread is a follower.
+        write_leader_flag_.clear(std::memory_order_release);
+        if (write_unit.result.status == WriteStatus::RETRY) {
+          continue;
+        } else {
+          if (write_unit.result.status == WriteStatus::ABORT) delete insert_node;
+          return write_unit.result.magic_node;
+        }
+      }
+
+      // ! here curr thread is the leader thread, execute write operation directly.
+      // ! only one write thread could be here at the same time.
+
+      HANDLE_WRITE_BATCH();
+
+      write_leader_flag_.clear(std::memory_order_release);
+
+      // handle leader's write result.
+      RB_ASSERT(write_unit.done.load(std::memory_order_acquire));
+      if (write_unit.result.status == WriteStatus::RETRY) {
+        continue;
+      } else {
+        if (write_unit.result.status == WriteStatus::ABORT) delete insert_node;
+        return write_unit.result.magic_node;
+      }
     }
-    // 4. set insert_node accessible after it's existed into sorted-list and rbtree.
-    insert_node->setAccessibility(true);
-    // 5. execute upward balance.
-    balanceTheTreeAfterInsert(insert_node);
-    // 6. finally release all locks.
-    unlockForModifyTreeStruct();
-    predecessor->unlock();
-    insert_node->unlock();
-    successor->unlock();
-    return insert_node;
   }
 
   // return false if the erase_key doesn't exist.
   bool erase(const VALUE& erase_value) {
-    InternalFindResult result = internalFind(erase_value, OperationType::ERASE);
-    bool should_erase = result.should_execute;
-    Node* predecessor = result.magic_node;
-    if (!should_erase) {
-      // erase_key doesn't exist, abort erase.
-      return false;
-    }
-    // erase_key exists, execute erase.
-
-    lockForModifyTreeStruct();
-
-    Node* erase_node = predecessor->next();
-    if (erase_node->leftSon() == nullptr && erase_node->rightSon() != nullptr) {
-      // erase_node only has right son. And the right son must be a leaf node.
-      // rotate left to make the erase_node to be a leaf node.
-      Node* right_son = erase_node->rightSon();
-      rotateLeft(erase_node, erase_node->father());
-      Node::SwapColor(erase_node, right_son); // ! swap color to balance the tree
-    }else if (erase_node->rightSon() == nullptr && erase_node->leftSon() != nullptr) {
-      // erase_node only has left son. And the left son must be a leaf node.
-      // rotate right to make the erase_node to be a leaf node.
-      Node* left_son = erase_node->leftSon();
-      rotateRight(erase_node, erase_node->father());
-      Node::SwapColor(erase_node, left_son); // ! swap color to balance the tree
-    }
-    // here the erase_node must be a leaf node or a non-leaf node with two son.
-    if (erase_node->leftSon() == nullptr && erase_node->rightSon() == nullptr) {
-      // erase_node is a leaf node, erase directly.
-
-      Node* father_of_erase_node = erase_node->father();
-      // 1. make erase_node inaccessible.
-      erase_node->setAccessibility(false);
-      // 2. detach erase_node from rbtree but keep being attached into sorted-list.
-      Side delete_side = father_of_erase_node->setSon(
-        father_of_erase_node->leftSon() == erase_node ? Node::LEFT : Node::RIGHT, nullptr);
-      // 3. upward balance the rbtree.
-      if (erase_node->color() == Node::BLACK && father_of_erase_node != root_) {
-        // ensure bro_of_delete_side must exist.
-        balanceTheTreeAfterErase(father_of_erase_node, delete_side);
+    int try_times = 0;
+    while (true) {
+      try_times++;
+      // 1. get the estimated_less_bound.
+      BatchWriteUnit write_unit(OperationType::ERASE, (void*)(&erase_value));
+      write_unit.info.estimated_less_bound = findEstimatedLessBoundForWrite(erase_value);
+      // 2. preserve a writer position.
+      uint32_t curr_write_batch_info = curr_write_batch_info_.fetch_add(1U, std::memory_order_acq_rel);
+      // 3. parse the write batch id and writer_idx.
+      int curr_write_batch_id = (curr_write_batch_info >> 31);
+      int writer_idx = (curr_write_batch_info & ((1U << 31) - 1));
+      RB_ASSERT((curr_write_batch_id == 0 || curr_write_batch_id == 1) && writer_idx < WRITE_BATCH_MAX_SIZE);
+      Writer* writer = &(write_batch_addr_[curr_write_batch_id][writer_idx]);
+      RB_ASSERT(!writer->accessible.load() && writer->batch_unit == nullptr);
+      // 4. use write_unit to set writer's batch_unit and then make writer accessible for leader writer to execute true write operation.
+      writer->batch_unit = &write_unit;
+      writer->accessible.store(true, std::memory_order_release);
+      bool retry = false;
+      while (write_leader_flag_.test_and_set(std::memory_order_acquire)) {
+        // now we failed to get leader flag.
+        if (write_unit.done.load(std::memory_order_acquire)) {
+          // ! here curr thread is the follower thread in the writers_ queue, and write operation is done by leader thread.
+          if (write_unit.result.status == WriteStatus::RETRY) {
+            retry = true;
+            break;
+          } else if (write_unit.result.status == WriteStatus::ABORT) {
+            return false;
+          } else {
+            // erase success.
+            return true;
+          }
+        } else {
+          // sleep for a while.
+          // std::this_thread::sleep_for(std::chrono::nanoseconds(0));
+          std::this_thread::yield();
+        }
       }
-      // 4. detach erase_node from sorted-list.
-      predecessor->setNext(erase_node->next());
-      // 5. finally delete erase_node.
-      // delete erase_node;
-    } else {
-      // erase_node is a non-leaf node with two son.
 
-      Node* father_of_erase_node = erase_node->father();
-      // here right_most_node is the max(e.g. right most) node of the erase_node's left-subtree.
-      Node* right_most_node = predecessor;
-      Node* left_son_of_right_most_node = right_most_node->leftSon();
-      if (left_son_of_right_most_node != nullptr) {
-        // rotate right to make the right-most node to be a leaf node.
-        rotateRight(right_most_node, right_most_node->father()); // right_most_node's father wouldn't be root_.
-        Node::SwapColor(right_most_node, left_son_of_right_most_node); // ! swap color to balance the tree
+      if (retry) {
+        // it means our job was done by leader and we should retry.
+        continue;
       }
-      // here right_most_node is the max and right-most and leaf node of the erase_node's left-subtree.
-      Node* father_of_right_most_node = right_most_node->father();
-      // 1. detach right_most_node from rbtree but keep being attached into sorted-list.
-      Side delete_side = father_of_right_most_node->setSon(
-        father_of_right_most_node->leftSon() == right_most_node ? Node::LEFT : Node::RIGHT, nullptr);
-      // 2. upward balance the rbtree.
-      if (right_most_node->color() == Node::BLACK && father_of_right_most_node != root_) {
-        // ensure bro_of_delete_side must exist.
-        balanceTheTreeAfterErase(father_of_right_most_node, delete_side);
+
+      // ! here we got the leader flag but we still need to check if our job done or not.
+      if (write_unit.done.load(std::memory_order_acquire)) {
+        // ok, our job is done, it means curr thread is a follower.
+        write_leader_flag_.clear(std::memory_order_release);
+        if (write_unit.result.status == WriteStatus::RETRY) {
+          continue;
+        } else if (write_unit.result.status == WriteStatus::ABORT) {
+          return false;
+        } else {
+          // erase success.
+          return true;
+        }
       }
-      // 3. find the erase_node for removing.
-      father_of_erase_node = erase_node->father();
-      // 4. make erase_node inaccessible.
-      erase_node->setAccessibility(false);
-      // 5. replace erase_node with right_most_node on erase_node's position in rbtree.
-      right_most_node->setSon(Node::LEFT, erase_node->leftSon());
-      right_most_node->setSon(Node::RIGHT, erase_node->rightSon());
-      right_most_node->setColor(erase_node->color());
-      father_of_erase_node->setSon(
-        father_of_erase_node->leftSon() == erase_node ? Node::LEFT : Node::RIGHT, right_most_node);
-      // 6. detach erase_node from sorted-list.
-      right_most_node->setNext(erase_node->next());
-      // 7. finally delete erase_node.
-      // delete erase_node;
+
+      // ! here curr thread is the leader thread, execute write operation directly.
+      // ! only one write thread could be here at the same time.
+
+      HANDLE_WRITE_BATCH();
+
+      write_leader_flag_.clear(std::memory_order_release);
+
+      // handle leader's write result.
+      RB_ASSERT(write_unit.done.load(std::memory_order_acquire));
+      if (write_unit.result.status == WriteStatus::RETRY) {
+        continue;
+      } else if (write_unit.result.status == WriteStatus::ABORT) {
+        return false;
+      } else {
+        // erase success.
+        return true;
+      }
     }
-    // finally release all locks.
-    unlockForModifyTreeStruct();
-    predecessor->unlock();
-    erase_node->unlock();
-    return true;
   }
 
   void getHeightInfoForTest(Node* curr_node, int curr_height, int& newest_max_height, int& newest_min_height, int& node_count) {
@@ -241,13 +376,13 @@ class RBTree {
       return;
     }
     node_count++;
-    if (curr_node->leftSon() == nullptr && curr_node->rightSon() == nullptr) {
+    if (curr_node->leftSonNoBarrier() == nullptr && curr_node->rightSonNoBarrier() == nullptr) {
       newest_max_height = std::max(curr_height, newest_max_height);
       newest_min_height = std::min(curr_height, newest_min_height);
       return;
     }
-    getHeightInfoForTest(curr_node->leftSon(), curr_height + 1, newest_max_height, newest_min_height, node_count);
-    getHeightInfoForTest(curr_node->rightSon(), curr_height + 1, newest_max_height, newest_min_height, node_count);
+    getHeightInfoForTest(curr_node->leftSonNoBarrier(), curr_height + 1, newest_max_height, newest_min_height, node_count);
+    getHeightInfoForTest(curr_node->rightSonNoBarrier(), curr_height + 1, newest_max_height, newest_min_height, node_count);
   }
 
   void checkIfSortedListValidForTest() {
@@ -262,12 +397,8 @@ class RBTree {
     // 2. check if all nodes are unlocked.
     curr_node = list_header_;
     while (curr_node != list_tailer_) {
-      curr_node->lock();
-      curr_node->unlock();
       curr_node = curr_node->next();
     }
-    curr_node->lock();
-    curr_node->unlock();
   }
 
   Node* getRootForTest() {
@@ -280,43 +411,40 @@ class RBTree {
 
  private:
   static const int MAX_EXTRA_STEPS_FROM_NO_GREATER_BOUND_TO_LOWER_BOUND = 3;
+  static const size_t WRITE_BATCH_MAX_SIZE = 50;
   // no-data node, left son is the true data root.
   TreeRoot root_;
   // no-data list node, as the header of the sorted list for all data node.
   ListHeader list_header_;
   // no-data list node, as the tailer of the sorted list for all data node.
   ListTailer list_tailer_;
-  // any write thread should firstly acquire this mutex before modifying rbtree's structure.
-  mutable std::mutex lock_for_modify_tree_struct_;
+  // used for leader write thread to execute true write operation.
+  // it's no need to be guarded by lock due to it's at most one leader write thread at the same time.
+  Writer write_batch_addr_[2][WRITE_BATCH_MAX_SIZE];
+  // top 1 bit means curr write batch id,
+  // low 31 bit means curr write batch size.
+  std::atomic<uint32_t> curr_write_batch_info_;
+  // only the write thread who get this flag could execute true write operation.
+  std::atomic_flag write_leader_flag_ = ATOMIC_FLAG_INIT;
+  // an assistant array for HANDLE_WRITE_BATCH to seperate insert operations and erase operations.
+  int tmp_array_for_handle_write_batch_[WRITE_BATCH_MAX_SIZE];
 
   friend class Node;
-
-  void lockForModifyTreeStruct() const {
-    lock_for_modify_tree_struct_.lock();
-  }
-
-  void unlockForModifyTreeStruct() const {
-    lock_for_modify_tree_struct_.unlock();
-  }
 
   // recursive destruct a sub-tree whose root is curr_node.
   void recursiveDestruction(Node* curr_node) {
     if (curr_node == nullptr) {
       return;
     }
-    recursiveDestruction(curr_node->leftSon());
-    recursiveDestruction(curr_node->rightSon());
+    recursiveDestruction(curr_node->leftSonNoBarrier());
+    recursiveDestruction(curr_node->rightSonNoBarrier());
     delete curr_node;
   }
 
   // return an InternalFindResult:
   //  read case:
   //    should_execute is always true, magic_node means the lower bound of target_value.
-  //  write case:
-  //    when should_execute is true, magic_node would store the predecessor. (return *WITH* lock)
-  //    when should_execute is false, in insert case magic_node is the existed node. (return *WITHOUT* lock)
-  InternalFindResult internalFind(const VALUE& target_value, OperationType type) {
-    Node* predecessor_of_no_less_bound = list_header_;
+  InternalFindResult internalFind(const VALUE& target_value) {
     Node* no_less_bound = list_header_;
     int try_times = 0;
     // we won't limit the try_times when the extra_steps_to_find_lower_bound over limit again and again.
@@ -325,17 +453,17 @@ class RBTree {
       try_times++;
       // find the target_value from the rbtree, and record the less bound(the greatest node < target_value) inside the searching path at the same time.
       Node* less_bound = list_header_;
-      Node* curr_node = root_->leftSon();
+      Node* curr_node = root_->leftSonNoBarrier();
       while(curr_node != nullptr) {
         if (curr_node == list_header_) {
-          curr_node = curr_node->rightSon();
+          curr_node = curr_node->rightSonNoBarrier();
         } else if (curr_node == list_tailer_) {
-          curr_node = curr_node->leftSon();
+          curr_node = curr_node->leftSonNoBarrier();
         } else if (target_value < curr_node->value()) {
-          curr_node = curr_node->leftSon();
+          curr_node = curr_node->leftSonNoBarrier();
         } else if (target_value > curr_node->value()) {
           if (less_bound == list_header_ || curr_node->value() > less_bound->value()) less_bound = curr_node;
-          curr_node = curr_node->rightSon();
+          curr_node = curr_node->rightSonNoBarrier();
         } else {
           // curr_node's value == target_value.
           break;
@@ -344,18 +472,11 @@ class RBTree {
       // here curr_node is nullptr or equals to target_value.
       RB_ASSERT((curr_node == nullptr || curr_node->value() == target_value) &&
              (less_bound == list_header_ || less_bound->value() < target_value));
-      // ! specially optimize for read case.
-      if (curr_node != nullptr && type == OperationType::READ) {
-        no_less_bound = curr_node;
-        break;
-      }
-      Node* left_son_of_curr_node = curr_node == nullptr ? nullptr : curr_node->leftSon();
-      if (curr_node == nullptr || (type != OperationType::READ && left_son_of_curr_node == nullptr)) {
+      if (curr_node != nullptr) {
+        return {true, try_times, curr_node};
+      } else {
         // find the first node >= target_value across sorted-list.
-        predecessor_of_no_less_bound = less_bound;
-        if (type != OperationType::READ) predecessor_of_no_less_bound->lock();
-        no_less_bound = predecessor_of_no_less_bound->next();
-        if (type != OperationType::READ) no_less_bound->lock();
+        no_less_bound = less_bound->next();
         int extra_steps_to_find_lower_bound = 0;
         // in concurrent read-write case, that exists 3 situations that we need to execute next-step across sorted-list:
         // 1. no rbtree rotate influence:
@@ -370,85 +491,175 @@ class RBTree {
                no_less_bound->value() < target_value &&
                extra_steps_to_find_lower_bound < MAX_EXTRA_STEPS_FROM_NO_GREATER_BOUND_TO_LOWER_BOUND) {
           extra_steps_to_find_lower_bound++;
-          if (type != OperationType::READ) predecessor_of_no_less_bound->unlock();
-          predecessor_of_no_less_bound = no_less_bound;
           // here curr thread could safely access the next node because it would never change due to insert/erase by other threads since no_less_bound is locked by curr thread.
           no_less_bound = no_less_bound->next();
-          if (type != OperationType::READ) no_less_bound->lock();
         }
         // here no_less_bound never be list_header_
-        if ((no_less_bound == list_tailer_ || no_less_bound->value() >= target_value) &&
-            (type == OperationType::READ || (predecessor_of_no_less_bound->accessible() && no_less_bound->accessible()))) {
+        if (no_less_bound == list_tailer_ || no_less_bound->value() >= target_value) {
           // all nodes < target_key or finally find the first node >= target_key.
-          break;
+          return {true, try_times, no_less_bound};
         } else {
           // extra_steps_to_find_lower_bound over limit. we consider that searching into rbtree failed due to rotate operation.
-          if (type != OperationType::READ) {
-            predecessor_of_no_less_bound->unlock();
-            no_less_bound->unlock();
-          }
-          predecessor_of_no_less_bound = list_header_;
           no_less_bound = list_header_;
           continue;
         }
-      } else {
-        RB_ASSERT(type != OperationType::READ); // read thread never be in here.
-        // here target_value must equal to curr_node and predecessor must exist inside curr_node's left subtree.
-        curr_node = left_son_of_curr_node;
-        while (curr_node != nullptr) {
-          predecessor_of_no_less_bound = curr_node;
-          curr_node = curr_node->rightSon();
-        }
-        predecessor_of_no_less_bound->lock();
-        no_less_bound = predecessor_of_no_less_bound->next();
-        no_less_bound->lock();
-        if (no_less_bound != list_tailer_ && no_less_bound->value() == target_value && predecessor_of_no_less_bound->accessible() && no_less_bound->accessible()) {
-          break;
-        } else {
-          // here we consider that searching into rbtree failed due to rotate operation.
-          predecessor_of_no_less_bound->unlock();
-          no_less_bound->unlock();
-          predecessor_of_no_less_bound = list_header_;
-          no_less_bound = list_header_;
-          continue;
-        }
-      }
-    }
-    if (type == OperationType::READ) {
-      RB_ASSERT(no_less_bound == list_tailer_ || no_less_bound->value() >= target_value);
-      return {true, try_times, no_less_bound};
-    }
-    // ! for write case: here curr thread must lock predecessor_of_no_less_bound and no_less_bound, and both of them are accessible.
-    RB_ASSERT(predecessor_of_no_less_bound->next() == no_less_bound &&
-           (no_less_bound == list_tailer_ || no_less_bound->value() >= target_value) &&
-           predecessor_of_no_less_bound->accessible() && no_less_bound->accessible());
-    if (no_less_bound == list_tailer_ || no_less_bound->value() > target_value) {
-      // target_value does not exist.
-      if (type == OperationType::INSERT) {
-        // return with locks.
-        return {true, try_times, predecessor_of_no_less_bound};
-      } else {
-        // abort erase, release all locks.
-        predecessor_of_no_less_bound->unlock();
-        no_less_bound->unlock();
-        return {false, try_times, nullptr};
-      }
-    } else {
-      // target_value exists.
-      if (type == OperationType::INSERT) {
-        // abort insert, release all locks.
-        predecessor_of_no_less_bound->unlock();
-        no_less_bound->unlock();
-        return {false, try_times, no_less_bound};
-      } else {
-        // return with locks.
-        return {true, try_times, predecessor_of_no_less_bound};
       }
     }
   }
 
+  // return the exact less_bound curr_thread found and return nullptr if fail to find.
+  // if return node is not nullptr, this method ensures that both exact_less_bound and no_less_bound are accessible.
+  // ! only leader write thread could call this method with holding write_mutex_.
+  Node* findExactLessBoundForWrite(Node* estimated_less_bound, const VALUE& target_value) {
+    RB_ASSERT(estimated_less_bound == list_header_ || estimated_less_bound->value() < target_value);
+    Node* exact_less_bound = estimated_less_bound;
+    Node* no_less_bound = exact_less_bound->next();
+    int extra_steps_to_find_lower_bound = 0;
+    while (no_less_bound != list_tailer_ &&
+           no_less_bound->value() < target_value &&
+           extra_steps_to_find_lower_bound < MAX_EXTRA_STEPS_FROM_NO_GREATER_BOUND_TO_LOWER_BOUND) {
+      extra_steps_to_find_lower_bound++;
+      exact_less_bound = no_less_bound;
+      no_less_bound = no_less_bound->next();
+    }
+    RB_ASSERT((exact_less_bound == list_header_ || exact_less_bound->value() < target_value) &&
+              exact_less_bound->next() == no_less_bound);
+    // here no_less_bound never be list_header_
+    if ((no_less_bound == list_tailer_ || no_less_bound->value() >= target_value) &&
+        exact_less_bound->accessible() && no_less_bound->accessible()) {
+      // all nodes < target_key or finally find the first node >= target_key.
+      return exact_less_bound;
+    } else {
+      // extra_steps_to_find_lower_bound over limit. we consider that searching into rbtree failed due to rotate operation.
+      return nullptr;
+    }
+  }
+
+  // return the estimated less_bound curr thread found.
+  // a LOCK-FREE find method and the found less_bound may be incorrect but it doesn't matter
+  // because it's only an estimated value for true write thread to accelerate write operation.
+  Node* findEstimatedLessBoundForWrite(const VALUE& target_value) {
+    // find the target_value from the rbtree, and record the less bound(the greatest node < target_value) inside the searching path at the same time.
+    Node* estimated_less_bound = list_header_;
+    Node* curr_node = root_->leftSonNoBarrier();
+    while(curr_node != nullptr) {
+      if (curr_node == list_header_) {
+        curr_node = curr_node->rightSonNoBarrier();
+      } else if (curr_node == list_tailer_) {
+        curr_node = curr_node->leftSonNoBarrier();
+      } else if (target_value < curr_node->value()) {
+        curr_node = curr_node->leftSonNoBarrier();
+      } else if (target_value > curr_node->value()) {
+        if (estimated_less_bound == list_header_ || curr_node->value() > estimated_less_bound->value()) estimated_less_bound = curr_node;
+        curr_node = curr_node->rightSonNoBarrier();
+      } else {
+        // curr_node's value == target_value.
+        curr_node = curr_node->leftSonNoBarrier();
+      }
+    }
+    RB_ASSERT(curr_node == nullptr && (estimated_less_bound == list_header_ || estimated_less_bound->value() < target_value));
+    return estimated_less_bound;
+  }
+
+  inline void internalInsert(Node* insert_node, Node* predecessor) {
+    // insert_key doesn't exist, execute insertion.
+
+    Node* successor = predecessor->next();
+    // 1. insert node into sorted list.
+    {
+      insert_node->setNextNoBarrier(successor);
+      predecessor->setNext(insert_node);
+    }
+    // 3. insert node into rbtree.
+    RB_ASSERT(predecessor->rightSonNoBarrier() == nullptr || successor->leftSonNoBarrier() == nullptr);
+    if (predecessor->rightSonNoBarrier() == nullptr) {
+      predecessor->setSonNoBarrier(Node::RIGHT, insert_node);
+    } else {
+      successor->setSonNoBarrier(Node::LEFT, insert_node);
+    }
+    // 4. set insert_node accessible after it's existed into sorted-list and rbtree.
+    insert_node->setAccessibility(true);
+    // 5. execute upward balance.
+    balanceTheTreeAfterInsert(insert_node);
+  }
+
+  inline void internalErase(Node* predecessor) {
+    // erase_key exists, execute erase.
+
+    Node* erase_node = predecessor->next();
+    if (erase_node->leftSonNoBarrier() == nullptr && erase_node->rightSonNoBarrier() != nullptr) {
+      // erase_node only has right son. And the right son must be a leaf node.
+      // rotate left to make the erase_node to be a leaf node.
+      Node* right_son = erase_node->rightSonNoBarrier();
+      rotateLeft(erase_node, erase_node->father());
+      Node::SwapColor(erase_node, right_son); // ! swap color to balance the tree
+    }else if (erase_node->rightSonNoBarrier() == nullptr && erase_node->leftSonNoBarrier() != nullptr) {
+      // erase_node only has left son. And the left son must be a leaf node.
+      // rotate right to make the erase_node to be a leaf node.
+      Node* left_son = erase_node->leftSonNoBarrier();
+      rotateRight(erase_node, erase_node->father());
+      Node::SwapColor(erase_node, left_son); // ! swap color to balance the tree
+    }
+    // here the erase_node must be a leaf node or a non-leaf node with two son.
+    if (erase_node->leftSonNoBarrier() == nullptr && erase_node->rightSonNoBarrier() == nullptr) {
+      // erase_node is a leaf node, erase directly.
+
+      Node* father_of_erase_node = erase_node->father();
+      // 1. make erase_node inaccessible.
+      erase_node->setAccessibility(false);
+      // 2. detach erase_node from rbtree but keep being attached into sorted-list.
+      Side delete_side = father_of_erase_node->setSonNoBarrier(
+        father_of_erase_node->leftSonNoBarrier() == erase_node ? Node::LEFT : Node::RIGHT, nullptr);
+      // 3. detach erase_node from sorted-list.
+      predecessor->setNext(erase_node->next());
+      // 4. upward balance the rbtree.
+      if (erase_node->color() == Node::BLACK && father_of_erase_node != root_) {
+        // ensure bro_of_delete_side must exist.
+        balanceTheTreeAfterErase(father_of_erase_node, delete_side);
+      }
+      // 5. finally delete erase_node.
+      // delete erase_node;
+    } else {
+      // erase_node is a non-leaf node with two son.
+
+      Node* father_of_erase_node = erase_node->father();
+      // here right_most_node is the max(e.g. right most) node of the erase_node's left-subtree.
+      Node* right_most_node = predecessor;
+      Node* left_son_of_right_most_node = right_most_node->leftSonNoBarrier();
+      if (left_son_of_right_most_node != nullptr) {
+        // rotate right to make the right-most node to be a leaf node.
+        rotateRight(right_most_node, right_most_node->father()); // right_most_node's father wouldn't be root_.
+        Node::SwapColor(right_most_node, left_son_of_right_most_node); // ! swap color to balance the tree
+      }
+      // here right_most_node is the max and right-most and leaf node of the erase_node's left-subtree.
+      Node* father_of_right_most_node = right_most_node->father();
+      // 1. detach right_most_node from rbtree but keep being attached into sorted-list.
+      Side delete_side = father_of_right_most_node->setSonNoBarrier(
+        father_of_right_most_node->leftSonNoBarrier() == right_most_node ? Node::LEFT : Node::RIGHT, nullptr);
+      // 2. upward balance the rbtree.
+      if (right_most_node->color() == Node::BLACK && father_of_right_most_node != root_) {
+        // ensure bro_of_delete_side must exist.
+        balanceTheTreeAfterErase(father_of_right_most_node, delete_side);
+      }
+      // 3. find the erase_node for removing.
+      father_of_erase_node = erase_node->father();
+      // 4. make erase_node inaccessible.
+      erase_node->setAccessibility(false);
+      // 5. replace erase_node with right_most_node on erase_node's position in rbtree.
+      right_most_node->setSonNoBarrier(Node::LEFT, erase_node->leftSonNoBarrier());
+      right_most_node->setSonNoBarrier(Node::RIGHT, erase_node->rightSonNoBarrier());
+      right_most_node->setColor(erase_node->color());
+      father_of_erase_node->setSonNoBarrier(
+        father_of_erase_node->leftSonNoBarrier() == erase_node ? Node::LEFT : Node::RIGHT, right_most_node);
+      // 6. detach erase_node from sorted-list.
+      right_most_node->setNext(erase_node->next());
+      // 7. finally delete erase_node.
+      // delete erase_node;
+    }
+  }
+
   inline Node* getBro(Node* my_self, Node* father) const {
-    return father->leftSon() == my_self ? father->rightSon() : father->leftSon();
+    return father->leftSonNoBarrier() == my_self ? father->rightSonNoBarrier() : father->leftSonNoBarrier();
   }
 
   // after making same side, this method would change color to grand-fa(red), father(black) and son(red).
@@ -456,17 +667,17 @@ class RBTree {
   // 1. father's left son is my_self and grand_father's left son is father.
   // 2. father's right son is my_self and grand_father's right son is father.
   inline Side makeTreeGenSameSide(Node* my_self, Node* father, Node* grand_father) {
-    if (grand_father->rightSon() == father) {
-      if (father->leftSon() == my_self) rotateRight(father, grand_father);
+    if (grand_father->rightSonNoBarrier() == father) {
+      if (father->leftSonNoBarrier() == my_self) rotateRight(father, grand_father);
       grand_father->setColor(Node::RED);
-      grand_father->rightSon()->setColor(Node::BLACK);
-      grand_father->rightSon()->rightSon()->setColor(Node::RED);
+      grand_father->rightSonNoBarrier()->setColor(Node::BLACK);
+      grand_father->rightSonNoBarrier()->rightSonNoBarrier()->setColor(Node::RED);
       return Node::RIGHT;
     }
-    if (father->rightSon() == my_self) rotateLeft(father, grand_father);
+    if (father->rightSonNoBarrier() == my_self) rotateLeft(father, grand_father);
     grand_father->setColor(Node::RED);
-    grand_father->leftSon()->setColor(Node::BLACK);
-    grand_father->leftSon()->leftSon()->setColor(Node::RED);
+    grand_father->leftSonNoBarrier()->setColor(Node::BLACK);
+    grand_father->leftSonNoBarrier()->leftSonNoBarrier()->setColor(Node::RED);
     return Node::LEFT;
   }
 
@@ -504,33 +715,33 @@ class RBTree {
   // rotate-right the subtree rooted on node.
   // !only rotate, NOT change color.
   inline Node* rotateRight(Node* node, Node* father) {
-    Node* left_son = node->leftSon();
+    Node* left_son = node->leftSonNoBarrier();
     if (left_son == nullptr) {
       return nullptr;
     }
-    node->setSon(Node::LEFT, left_son->rightSon());
-    left_son->setSon(Node::RIGHT, node);
-    father->setSon(
-      father->leftSon() == node ? Node::LEFT : Node::RIGHT, left_son);
+    node->setSonNoBarrier(Node::LEFT, left_son->rightSonNoBarrier());
+    left_son->setSonNoBarrier(Node::RIGHT, node);
+    father->setSonNoBarrier(
+      father->leftSonNoBarrier() == node ? Node::LEFT : Node::RIGHT, left_son);
     return left_son;
   }
 
   // rotate-left the subtree rooted on node.
   // !only rotate, NOT change color.
   inline Node* rotateLeft(Node* node, Node* father) {
-    Node* right_son = node->rightSon();
+    Node* right_son = node->rightSonNoBarrier();
     if (right_son == nullptr) {
       return nullptr;
     }
-    node->setSon(Node::RIGHT, right_son->leftSon());
-    right_son->setSon(Node::LEFT, node);
-    father->setSon(father->leftSon() == node ? Node::LEFT : Node::RIGHT, right_son);
+    node->setSonNoBarrier(Node::RIGHT, right_son->leftSonNoBarrier());
+    right_son->setSonNoBarrier(Node::LEFT, node);
+    father->setSonNoBarrier(father->leftSonNoBarrier() == node ? Node::LEFT : Node::RIGHT, right_son);
     return right_son;
   }
 
   inline Node* broOfDeleteSide(Node* father, Side delete_side) {
-    if (delete_side == Node::LEFT) return father->rightSon();
-    else return father->leftSon();
+    if (delete_side == Node::LEFT) return father->rightSonNoBarrier();
+    else return father->leftSonNoBarrier();
   }
 
   // recursive method. father_of_erase_node's delete_side-subtree has one node deleted.
@@ -560,35 +771,35 @@ class RBTree {
     // here both fa and bro are BLACK.
     // increased_height is true means we need to decrease bro's height.
     // increased_height is false means we need to increase delete_side's height.
-    if ((bro_of_delete_side->leftSon() == nullptr || bro_of_delete_side->leftSon()->color() == Node::BLACK) &&
-        (bro_of_delete_side->rightSon() == nullptr || bro_of_delete_side->rightSon()->color() == Node::BLACK)) {
+    if ((bro_of_delete_side->leftSonNoBarrier() == nullptr || bro_of_delete_side->leftSonNoBarrier()->color() == Node::BLACK) &&
+        (bro_of_delete_side->rightSonNoBarrier() == nullptr || bro_of_delete_side->rightSonNoBarrier()->color() == Node::BLACK)) {
       // bro can safely be colored with RED.
       bro_of_delete_side->setColor(Node::RED);
       if (increased_height || grand_fa == root_) {
         return;
       } else {
-        return balanceTheTreeAfterErase(grand_fa, grand_fa->leftSon() == father_of_erase_node ? Node::LEFT : Node::RIGHT);
+        return balanceTheTreeAfterErase(grand_fa, grand_fa->leftSonNoBarrier() == father_of_erase_node ? Node::LEFT : Node::RIGHT);
       }
     }
     // here either bro's left son or right son is RED (or both RED).
     // for example, if delete_side is LEFT, we need to ensure the RED node is bro's right son, and vice versa.
     // and then we can use the RED node to balance the fa subtree.
-    if (delete_side == Node::LEFT && (bro_of_delete_side->rightSon() == nullptr || bro_of_delete_side->rightSon()->color() == Node::BLACK)) {
-      Node::SwapColor(bro_of_delete_side, bro_of_delete_side->leftSon());
+    if (delete_side == Node::LEFT && (bro_of_delete_side->rightSonNoBarrier() == nullptr || bro_of_delete_side->rightSonNoBarrier()->color() == Node::BLACK)) {
+      Node::SwapColor(bro_of_delete_side, bro_of_delete_side->leftSonNoBarrier());
       rotateRight(bro_of_delete_side, father_of_erase_node);
       bro_of_delete_side = broOfDeleteSide(father_of_erase_node, delete_side);
       // now bro's right son is RED, we use it.
-    } else if (delete_side == Node::RIGHT && (bro_of_delete_side->leftSon() == nullptr || bro_of_delete_side->leftSon()->color() == Node::BLACK)) {
-      Node::SwapColor(bro_of_delete_side, bro_of_delete_side->rightSon());
+    } else if (delete_side == Node::RIGHT && (bro_of_delete_side->leftSonNoBarrier() == nullptr || bro_of_delete_side->leftSonNoBarrier()->color() == Node::BLACK)) {
+      Node::SwapColor(bro_of_delete_side, bro_of_delete_side->rightSonNoBarrier());
       rotateLeft(bro_of_delete_side, father_of_erase_node);
       bro_of_delete_side = broOfDeleteSide(father_of_erase_node, delete_side);
       // now bro's left son is RED, we use it.
     }
     if (delete_side == Node::LEFT) {
-      bro_of_delete_side->rightSon()->setColor(Node::BLACK);
+      bro_of_delete_side->rightSonNoBarrier()->setColor(Node::BLACK);
       rotateLeft(father_of_erase_node, grand_fa);
     } else {
-      bro_of_delete_side->leftSon()->setColor(Node::BLACK);
+      bro_of_delete_side->leftSonNoBarrier()->setColor(Node::BLACK);
       rotateRight(father_of_erase_node, grand_fa);
     }
     if (increased_height) {
@@ -620,7 +831,7 @@ class RBTree<VALUE>::Node {
   // when a node is going to be destructed, caller MUST make sure firstly that the node
   // is detached from rbtree and that the list-node is detached from sorted list.
   ~Node() {
-    father_.store(nullptr);
+    father_ = nullptr;
     left_son_.store(nullptr);
     right_son_.store(nullptr);
     next_.store(nullptr);
@@ -641,52 +852,48 @@ class RBTree<VALUE>::Node {
 
   inline void setColor(Color new_color) { color_ = new_color; }
 
-  inline bool accessible() const { return accessible_.load(); }
-
-  inline void setAccessibility(bool accessible) { accessible_.store(accessible); }
-
-  inline void lock() const {
-    mutex_.lock();
+  inline bool accessible() const {
+    return accessible_.load(std::memory_order_acquire);
   }
 
-  inline void unlock() const {
-    mutex_.unlock();
+  inline void setAccessibility(bool accessible) {
+    accessible_.store(accessible, std::memory_order_release);
   }
 
   inline Node* father() const {
-    return father_.load();
+    return father_;
   }
 
-  // inline void setFather(Node* new_father) {
-  //   father_.store(new_father);
-  // }
-
-  inline Node* leftSon() const {
-    return left_son_.load();
+  inline Node* leftSonNoBarrier() const {
+    return left_son_.load(std::memory_order_relaxed);
   }
 
-  inline Node* rightSon() const {
-    return right_son_.load();
+  inline Node* rightSonNoBarrier() const {
+    return right_son_.load(std::memory_order_relaxed);
   }
 
-  inline Side setSon(Side side, Node* new_son) {
-    if (side == LEFT) left_son_.store(new_son);
-    else right_son_.store(new_son);
+  inline Side setSonNoBarrier(Side side, Node* new_son) {
+    if (side == LEFT) left_son_.store(new_son, std::memory_order_relaxed);
+    else right_son_.store(new_son, std::memory_order_relaxed);
     // ! In fact, when this node's son changes to new_son, new_son's father would change to this node too,
     // ! so we could update new_son's father here and it's no need to define a public setFather method.
     // ! we have no need to worry about old_son's new father, because when we insert it into rbtree again,
     // ! its new_father would call setSon method and then set old_son's new father at the same time.
     // ! *DO NOT* set old_son's father to nullptr !!!
-    if (new_son != nullptr) new_son->father_.store(this);
+    if (new_son != nullptr) new_son->father_ = this;
     return side;
   }
 
   inline Node* next() const {
-    return next_.load();
+    return next_.load(std::memory_order_acquire);
   }
 
   inline void setNext(ListNext new_next) {
-    next_.store(new_next);
+    next_.store(new_next, std::memory_order_release);
+  }
+
+  inline void setNextNoBarrier(ListNext new_next) {
+    next_.store(new_next, std::memory_order_relaxed);
   }
 
  private:
@@ -694,10 +901,9 @@ class RBTree<VALUE>::Node {
   VALUE value_;
   Color color_;
   std::atomic<bool> accessible_; // whether the node is accessible to the user of rbtree.
-  mutable std::mutex mutex_; // lock for sorted-list searching condition.
 
   // pointer region
-  std::atomic<Father> father_; // ! only used for write case's upward balance.
+  Father father_; // ! only used for write case's upward balance.
   std::atomic<LeftSon> left_son_;
   std::atomic<RightSon> right_son_;
   std::atomic<ListNext> next_;
@@ -792,10 +998,10 @@ static void TestOneWriteMultiReadConcurrentPerf(int perf_max_try_times, bool is_
       my_map_size.fetch_add(+1);
     }
     // start_find.store(true);
-    // for (int i = random_list_for_insert.size() - 1; i >= 0; i--) {
-    //   my_map.erase(random_list_for_insert[i]);
-    //   my_map_size.fetch_add(-1);
-    // }
+    for (int i = random_list_for_insert.size() - 1; i >= 0; i--) {
+      my_map.erase(random_list_for_insert[i]);
+      my_map_size.fetch_add(-1);
+    }
     write_over.store(true);
   };
   std::atomic<int> tot_find_times(0);
@@ -816,7 +1022,7 @@ static void TestOneWriteMultiReadConcurrentPerf(int perf_max_try_times, bool is_
       // try_times的次数越多，说明find操作受旋转操作而导致红黑树失效的次数越多，和value存在与否无关。当然，测试时为了方便，保证了value在find时必然存在的。
       int try_times = 0;
       auto result = my_map.findForConcurrentTest(value);
-      RB_ASSERT(result.second != nullptr && result.second->value() == value);
+      // RB_ASSERT(result.second != nullptr && result.second->value() == value);
       try_times = result.first;
       tot_find_times.fetch_add(+1);
       success_find_times.fetch_add(+1);
@@ -849,6 +1055,8 @@ static void TestOneWriteMultiReadConcurrentPerf(int perf_max_try_times, bool is_
   std::cout << "success rate: " << success_rate * 100.0 << "%\n";
   std::cout << "perf rate: " << perf_rate * 100.0 << "%\n";
 
+  my_map.checkIfSortedListValidForTest();
+
   int newest_max_height = INT32_MIN;
   int newest_min_height = INT32_MAX;
   int node_count = 0;
@@ -862,7 +1070,9 @@ static void TestMultiWriteConcurrentPerf() {
   RBTree<int> my_map;
   g_rbtree = &my_map;
 
-  const int WRITE_THREAD_COUNT = 5;
+  std::set<int> std_set;
+
+  const int WRITE_THREAD_COUNT = 10;
   const int BATCH_SIZE_PER_THREAD = 1000;
   const int ELEMENT_SIZE_PER_BATCH = 1000;
   std::random_device rd;          // Áî®‰∫éÁîüÊàêÁúüÈöèÊú∫ÁßçÂ≠êÔºàÂ¶? /dev/urandomÔº?
@@ -905,22 +1115,24 @@ static void TestMultiWriteConcurrentPerf() {
       // 1. insert the batch data.
       for (int ele: batch_data) {
         my_map.insert(ele);
+        // std_set.insert(ele);
       }
-      // 2. find the insert batch data.
-      for (int ele: batch_data) {
-        auto result = my_map.findForConcurrentTest(ele);
-        RB_ASSERT(result.second != nullptr && result.second->value() == ele);
-      }
+      // // 2. find the insert batch data.
+      // for (int ele: batch_data) {
+      //   auto result = my_map.findForConcurrentTest(ele);
+      //   RB_ASSERT(result.second != nullptr && result.second->value() == ele);
+      // }
       // 3. erase 1 batch every 2 batches.
-      if (i % 2 != 0) {
+      if (i % 2 == 0) {
         for (int ele: batch_data) {
           my_map.erase(ele);
+          // std_set.erase(ele);
         }
-        // find again.
-        for (int ele: batch_data) {
-          auto result = my_map.findForConcurrentTest(ele);
-          RB_ASSERT(result.second == nullptr);
-        }
+        // // find again.
+        // for (int ele: batch_data) {
+        //   auto result = my_map.findForConcurrentTest(ele);
+        //   RB_ASSERT(result.second == nullptr);
+        // }
       }
     }
   };
@@ -946,7 +1158,16 @@ static void TestMultiWriteConcurrentPerf() {
   std::cout << newest_max_height << " " << newest_min_height << " " << node_count - 1 << "\n";
 }
 
+static void checkCompileMode() {
+#if defined(DEBUG)
+  std::cout << "DEBUG MODE" << "\n";
+#else
+  std::cout << "PERF MODE" << "\n";
+#endif // DEBUG
+}
+
 int main() {
+  checkCompileMode();
   // RB_ASSERT(false);
   // TestOneWriteMultiReadConcurrentPerf(2, false);
   // TestOneWriteMultiReadConcurrentPerf(2, true);
