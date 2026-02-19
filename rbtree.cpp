@@ -1075,6 +1075,7 @@ static void TestMultiWriteConcurrentPerf() {
   const int WRITE_THREAD_COUNT = 10;
   const int BATCH_SIZE_PER_THREAD = 1000;
   const int ELEMENT_SIZE_PER_BATCH = 1000;
+  const int BATCH_SIZE_FOR_INIT_DATA = 50;
   std::random_device rd;          // Áî®‰∫éÁîüÊàêÁúüÈöèÊú∫ÁßçÂ≠êÔºàÂ¶? /dev/urandomÔº?
   std::mt19937 gen(rd());         // ‰ΩøÁî®Ê¢ÖÊ£ÆÊóãËΩ¨ÁÆóÊ≥ï‰Ωú‰∏∫ÂºïÊìé
   std::uniform_int_distribution<> dis(INT32_MIN, INT32_MAX); // ÁîüÊàê [1, 100] ÁöÑÂùáÂåÄÊï¥Êï∞
@@ -1094,6 +1095,21 @@ static void TestMultiWriteConcurrentPerf() {
     }
     return vec;
   };
+  auto gen_init_data = [&gen_a_batch, BATCH_SIZE_FOR_INIT_DATA]() -> std::vector<std::vector<int>> {
+    std::vector<std::vector<int>> vec;
+    for (int i = 0; i < BATCH_SIZE_FOR_INIT_DATA; i++) {
+      vec.push_back(gen_a_batch());
+    }
+    return vec;
+  };
+  std::vector<std::vector<int>> init_data = gen_init_data();
+  // init the rbtree, init data size = BATCH_SIZE_FOR_INIT_DATA * ELEMENT_SIZE_PER_BATCH.
+  for (int i = 0; i < init_data.size(); i++) {
+    const std::vector<int>& batch_data = init_data[i];
+    for (int ele: batch_data) {
+      my_map.insert(ele);
+    }
+  }
   auto gen_a_thread_data = [&gen_a_batch, BATCH_SIZE_PER_THREAD]() -> std::vector<std::vector<int>> {
     std::vector<std::vector<int>> vec;
     for (int i = 0; i < BATCH_SIZE_PER_THREAD; i++) {
