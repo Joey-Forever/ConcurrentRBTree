@@ -7,6 +7,7 @@
 #include <random>
 #include <thread>
 #include <cassert>
+#include "/Users/caijiajian/Joey-Project-For-Linux/test_perf_dir/test_perf.h"
 
 #ifdef DEBUG
     #define RB_ASSERT(condition) \
@@ -1019,9 +1020,13 @@ static void checkCompileMode() {
 }
 
 int main() {
+  std::cout << "RBTree Performance Test" << "\n";
   checkCompileMode();
   // RB_ASSERT(false);
   // TestSingleThreadAbility(false);
   // TestSingleThreadAbility(true);
   TestMultiWriteConcurrentPerf();
+  // TestMultiReadFewWriteConcurrentPerf<RBTree<int>>([]() {
+  //   return std::make_unique<RBTree<int>>();
+  // });
 }
