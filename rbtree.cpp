@@ -36,15 +36,6 @@ class RBTree {
 
   enum OperationType { READ, INSERT, ERASE };
 
-  struct InternalFindResult {
-    // whether we should execute read/insert/erase and it's always true in read case.
-    bool should_execute;
-    // total searching times that current find has tried.
-    int try_times;
-    // pointer to the node that current case needs to execute next step.
-    Node* magic_node;
-  };
-
   enum WriteStatus { SUCCESS, RETRY, ABORT };
   struct WriteResult {
     WriteStatus status;
@@ -83,11 +74,6 @@ class RBTree {
     root_ = new Node();
     list_header_ = new Node();
     list_tailer_ = new Node();
-    // 1. insert list_header_ and list_tailer_ into rbtree.
-    root_->setSonNoBarrier(Node::LEFT, list_header_);
-    list_header_->setSonNoBarrier(Node::RIGHT, list_tailer_);
-    list_header_->setColor(Node::BLACK);
-    list_tailer_->setColor(Node::RED);
     // 2. insert list_header_ and list_tailer_ into sorted_list.
     list_header_->setNext(list_tailer_);
     // 3. make list_header_ and list_tailer_ accessible.
@@ -103,7 +89,7 @@ class RBTree {
 
   // find the accessible node == value.
   Node* find(const VALUE& value) {
-    Node* lower_bound = internalFind(value).magic_node;
+    Node* lower_bound = internalFind(value);
     if (lower_bound == list_tailer_ || lower_bound->value() > value || !lower_bound->accessible()) {
       return nullptr;
     } else {
@@ -112,24 +98,9 @@ class RBTree {
     }
   }
 
-  // return a std::pair:
-  //   the first element means the try_times to find the value,
-  //   the second element means the found accessible node.
-  std::pair<int, Node*> findForConcurrentTest(const VALUE& value) {
-    InternalFindResult result = internalFind(value);
-    int try_times = result.try_times;
-    Node* lower_bound = result.magic_node;
-    if (lower_bound == list_tailer_ || lower_bound->value() > value || !lower_bound->accessible()) {
-      return {try_times, nullptr};
-    } else {
-      // finally find the node == value.
-      return {try_times, lower_bound};
-    }
-  }
-
   // find the first accessible node >= value.
   Node* lowerBound(const VALUE& value) {
-    Node* lower_bound = internalFind(value).magic_node;
+    Node* lower_bound = internalFind(value);
     while(lower_bound != list_tailer_ && !lower_bound->accessible()) {
       lower_bound = lower_bound->next();
     }
@@ -221,9 +192,7 @@ class RBTree {
   template<typename U>
   Node* insert(U&& insert_value) {
     Node* insert_node = new Node(std::forward<U>(insert_value));
-    int try_times = 0;
     while (true) {
-      try_times++;
       // 1. get the estimated_less_bound.
       BatchWriteUnit write_unit(OperationType::INSERT, (void*)insert_node);
       write_unit.info.estimated_less_bound = findEstimatedLessBoundForWrite(insert_node->value());
@@ -294,9 +263,7 @@ class RBTree {
 
   // return false if the erase_key doesn't exist.
   bool erase(const VALUE& erase_value) {
-    int try_times = 0;
     while (true) {
-      try_times++;
       // 1. get the estimated_less_bound.
       BatchWriteUnit write_unit(OperationType::ERASE, (void*)(&erase_value));
       write_unit.info.estimated_less_bound = findEstimatedLessBoundForWrite(erase_value);
@@ -394,11 +361,6 @@ class RBTree {
       last_node = curr_node;
       curr_node = curr_node->next();
     }
-    // 2. check if all nodes are unlocked.
-    curr_node = list_header_;
-    while (curr_node != list_tailer_) {
-      curr_node = curr_node->next();
-    }
   }
 
   Node* getRootForTest() {
@@ -441,28 +403,20 @@ class RBTree {
     delete curr_node;
   }
 
-  // return an InternalFindResult:
-  //  read case:
-  //    should_execute is always true, magic_node means the lower bound of target_value.
-  InternalFindResult internalFind(const VALUE& target_value) {
+  // return the lower bound of target_value.
+  Node* internalFind(const VALUE& target_value) {
     Node* no_less_bound = list_header_;
-    int try_times = 0;
     // we won't limit the try_times when the extra_steps_to_find_lower_bound over limit again and again.
     // in some very rare cases, try_times would be large but it would finally success finding lowerbound and stop.
     while (true) {
-      try_times++;
       // find the target_value from the rbtree, and record the less bound(the greatest node < target_value) inside the searching path at the same time.
       Node* less_bound = list_header_;
       Node* curr_node = root_->leftSonNoBarrier();
       while(curr_node != nullptr) {
-        if (curr_node == list_header_) {
-          curr_node = curr_node->rightSonNoBarrier();
-        } else if (curr_node == list_tailer_) {
-          curr_node = curr_node->leftSonNoBarrier();
-        } else if (target_value < curr_node->value()) {
+        if (target_value < curr_node->value()) {
           curr_node = curr_node->leftSonNoBarrier();
         } else if (target_value > curr_node->value()) {
-          if (less_bound == list_header_ || curr_node->value() > less_bound->value()) less_bound = curr_node;
+          less_bound = curr_node;
           curr_node = curr_node->rightSonNoBarrier();
         } else {
           // curr_node's value == target_value.
@@ -473,7 +427,7 @@ class RBTree {
       RB_ASSERT((curr_node == nullptr || curr_node->value() == target_value) &&
              (less_bound == list_header_ || less_bound->value() < target_value));
       if (curr_node != nullptr) {
-        return {true, try_times, curr_node};
+        return curr_node;
       } else {
         // find the first node >= target_value across sorted-list.
         no_less_bound = less_bound->next();
@@ -497,7 +451,7 @@ class RBTree {
         // here no_less_bound never be list_header_
         if (no_less_bound == list_tailer_ || no_less_bound->value() >= target_value) {
           // all nodes < target_key or finally find the first node >= target_key.
-          return {true, try_times, no_less_bound};
+          return no_less_bound;
         } else {
           // extra_steps_to_find_lower_bound over limit. we consider that searching into rbtree failed due to rotate operation.
           no_less_bound = list_header_;
@@ -543,14 +497,10 @@ class RBTree {
     Node* estimated_less_bound = list_header_;
     Node* curr_node = root_->leftSonNoBarrier();
     while(curr_node != nullptr) {
-      if (curr_node == list_header_) {
-        curr_node = curr_node->rightSonNoBarrier();
-      } else if (curr_node == list_tailer_) {
-        curr_node = curr_node->leftSonNoBarrier();
-      } else if (target_value < curr_node->value()) {
+      if (target_value < curr_node->value()) {
         curr_node = curr_node->leftSonNoBarrier();
       } else if (target_value > curr_node->value()) {
-        if (estimated_less_bound == list_header_ || curr_node->value() > estimated_less_bound->value()) estimated_less_bound = curr_node;
+        estimated_less_bound = curr_node;
         curr_node = curr_node->rightSonNoBarrier();
       } else {
         // curr_node's value == target_value.
@@ -571,11 +521,13 @@ class RBTree {
       predecessor->setNext(insert_node);
     }
     // 3. insert node into rbtree.
-    RB_ASSERT(predecessor->rightSonNoBarrier() == nullptr || successor->leftSonNoBarrier() == nullptr);
-    if (predecessor->rightSonNoBarrier() == nullptr) {
+    RB_ASSERT((predecessor != list_header_ && predecessor->rightSonNoBarrier() == nullptr) || (successor != list_tailer_ && successor->leftSonNoBarrier() == nullptr) || root_->leftSonNoBarrier() == nullptr);
+    if (predecessor != list_header_ && predecessor->rightSonNoBarrier() == nullptr) {
       predecessor->setSonNoBarrier(Node::RIGHT, insert_node);
-    } else {
+    } else if (successor != list_tailer_ && successor->leftSonNoBarrier() == nullptr) {
       successor->setSonNoBarrier(Node::LEFT, insert_node);
+    } else {
+      root_->setSonNoBarrier(Node::LEFT, insert_node);
     }
     // 4. set insert_node accessible after it's existed into sorted-list and rbtree.
     insert_node->setAccessibility(true);
@@ -948,122 +900,6 @@ static void TestSingleThreadAbility(bool sequential_insert) {
   }
 }
 
-static void TestOneWriteMultiReadConcurrentPerf(int perf_max_try_times, bool is_worst_case) {
-  std::cout << "------------------------------------------------------------------------------------------------" << "\n";
-  std::cout << "concurrent test --- one write, multi read (perf_max_try_times = " << perf_max_try_times << ", is_worst_case = " << (is_worst_case ? "true" : "false") << "):\n";
-  RBTree<int> my_map;
-  g_rbtree = &my_map;
-  std::atomic<int> my_map_size(0);
-  std::set<int> init_set, random_set_for_insert;
-  std::vector<int> init_list, random_list_for_insert;
-  const int INIT_DATA_COUNT = 1024;
-  const int DATA_COUNT_FOR_INSERTION = 100000;
-  const int MAX_TRY_TIMES = INT32_MAX;
-  // x86-64 intel (11 read threads, MAX_EXTRA_STEPS_FROM_NO_GREATER_BOUND_TO_LOWER_BOUND = 3):
-  // random case (random insert value and random find value):
-  // try_times = 1 : 99.9997%
-  // try_times = 2 : 100%
-  // worst case (sequential insert and always find the last insert value):
-  // try_times = 1 : 97.6%
-  // try_times = 2 : 99.99%
-  const int PERF_MAX_TRY_TIMES = perf_max_try_times;
-  const int READ_THREAD_COUNT = 11;
-  std::random_device rd;          // Áî®‰∫éÁîüÊàêÁúüÈöèÊú∫ÁßçÂ≠êÔºàÂ¶? /dev/urandomÔº?
-  std::mt19937 gen(rd());         // ‰ΩøÁî®Ê¢ÖÊ£ÆÊóãËΩ¨ÁÆóÊ≥ï‰Ωú‰∏∫ÂºïÊìé
-  std::uniform_int_distribution<> dis(0, 100000000); // ÁîüÊàê [1, 100] ÁöÑÂùáÂåÄÊï¥Êï∞
-  int value = 0;
-  auto gen_value = [&gen, &dis, &value, is_worst_case]() -> int {
-    int a;
-    if (!is_worst_case) a = dis(gen);
-    else a = value++; // worst case: sequential insert
-    return a;
-  };
-  for (int i = 0; i < INIT_DATA_COUNT; i++) {
-    int a = gen_value();
-    if (init_set.find(a) != init_set.end()) i--;
-    else init_set.insert(a), init_list.push_back(a), my_map.insert(a);
-  }
-  my_map_size.store(INIT_DATA_COUNT);
-  for (int i = 0; i < DATA_COUNT_FOR_INSERTION; i++) {
-    int a = gen_value();
-    if (init_set.find(a) != init_set.end() || random_set_for_insert.find(a) != random_set_for_insert.end()) i--;
-    else random_set_for_insert.insert(a), random_list_for_insert.push_back(a);
-  }
-  std::atomic<bool> write_over(false);
-  std::atomic<bool> start_find(false);
-  auto write_ope = [&my_map, &my_map_size, &random_list_for_insert, &write_over, &start_find]() {
-    start_find.store(true);
-    for (const auto ele: random_list_for_insert) {
-      my_map.insert(ele);
-      my_map_size.fetch_add(+1);
-    }
-    // start_find.store(true);
-    for (int i = random_list_for_insert.size() - 1; i >= 0; i--) {
-      my_map.erase(random_list_for_insert[i]);
-      my_map_size.fetch_add(-1);
-    }
-    write_over.store(true);
-  };
-  std::atomic<int> tot_find_times(0);
-  std::atomic<int> success_find_times(0);
-  std::atomic<int> perf_find_times(0);
-  std::atomic<int> max_try_times(0);
-  auto find_ope = [&my_map, &my_map_size, &write_over, &start_find, &init_list, &random_list_for_insert,
-                   &tot_find_times, &success_find_times, &perf_find_times, &max_try_times, PERF_MAX_TRY_TIMES, is_worst_case]() {
-    while(!start_find.load()) {}
-    int idx = 0;
-    while(!write_over.load()) {
-      int value;
-      int local_my_map_size = my_map_size.load();
-      if (is_worst_case) idx = local_my_map_size - 1; // worst case: always find the last insert value
-      if (idx < INIT_DATA_COUNT) value = init_list[idx];
-      else if (idx < local_my_map_size) value = random_list_for_insert[idx - INIT_DATA_COUNT];
-      else idx = 0, value = init_list[idx];
-      // try_times的次数越多，说明find操作受旋转操作而导致红黑树失效的次数越多，和value存在与否无关。当然，测试时为了方便，保证了value在find时必然存在的。
-      int try_times = 0;
-      auto result = my_map.findForConcurrentTest(value);
-      // RB_ASSERT(result.second != nullptr && result.second->value() == value);
-      try_times = result.first;
-      tot_find_times.fetch_add(+1);
-      success_find_times.fetch_add(+1);
-      if (try_times <= PERF_MAX_TRY_TIMES) perf_find_times.fetch_add(+1);
-      int local_max_try_times = max_try_times.load();
-      do {
-        if (local_max_try_times >= try_times) break;
-      } while(!max_try_times.compare_exchange_strong(local_max_try_times, try_times));
-      idx++;
-    }
-  };
-  std::thread write_thread(write_ope);
-  std::vector<std::thread> read_threads;
-
-  for (int i = 0; i < READ_THREAD_COUNT; i++) {
-    read_threads.emplace_back(find_ope);
-  }
-
-  write_thread.join();
-  for (auto& t : read_threads) {
-    t.join();
-  }
-  double tot = tot_find_times.load();
-  double success = success_find_times.load();
-  double perf = perf_find_times.load();
-
-  double success_rate = success / tot;
-  double perf_rate = perf / tot;
-  std::cout << "tot = " << tot_find_times.load() << ", success = " << success_find_times.load() << ", perf = " << perf_find_times.load() << ", max try times = " << max_try_times.load() << "\n";
-  std::cout << "success rate: " << success_rate * 100.0 << "%\n";
-  std::cout << "perf rate: " << perf_rate * 100.0 << "%\n";
-
-  my_map.checkIfSortedListValidForTest();
-
-  int newest_max_height = INT32_MIN;
-  int newest_min_height = INT32_MAX;
-  int node_count = 0;
-  my_map.getHeightInfoForTest(my_map.getRootForTest(), 0, newest_max_height, newest_min_height, node_count);
-  std::cout << newest_max_height << " " << newest_min_height << " " << node_count - 1 << "\n";
-}
-
 static void TestMultiWriteConcurrentPerf() {
   std::cout << "------------------------------------------------------------------------------------------------" << "\n";
   std::cout << "concurrent test --- multi write" << "\n";
@@ -1135,8 +971,8 @@ static void TestMultiWriteConcurrentPerf() {
       }
       // // 2. find the insert batch data.
       // for (int ele: batch_data) {
-      //   auto result = my_map.findForConcurrentTest(ele);
-      //   RB_ASSERT(result.second != nullptr && result.second->value() == ele);
+      //   auto result = my_map.find(ele);
+      //   RB_ASSERT(result != nullptr && result->value() == ele);
       // }
       // 3. erase 1 batch every 2 batches.
       if (i % 2 == 0) {
@@ -1146,8 +982,8 @@ static void TestMultiWriteConcurrentPerf() {
         }
         // // find again.
         // for (int ele: batch_data) {
-        //   auto result = my_map.findForConcurrentTest(ele);
-        //   RB_ASSERT(result.second == nullptr);
+        //   auto result = my_map.find(ele);
+        //   RB_ASSERT(result == nullptr);
         // }
       }
     }
@@ -1185,8 +1021,6 @@ static void checkCompileMode() {
 int main() {
   checkCompileMode();
   // RB_ASSERT(false);
-  // TestOneWriteMultiReadConcurrentPerf(2, false);
-  // TestOneWriteMultiReadConcurrentPerf(2, true);
   // TestSingleThreadAbility(false);
   // TestSingleThreadAbility(true);
   TestMultiWriteConcurrentPerf();
