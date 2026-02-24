@@ -55,10 +55,10 @@ class RBTree {
 
   struct BatchWriteUnit {
     explicit BatchWriteUnit(OperationType write_type, WriteData init_data)
-        : info(write_type, init_data), done(false) {}
+        : info(write_type, init_data) {}
     WriteInfo info;
     WriteResult result;
-    std::atomic<bool> done;
+    // std::atomic<bool> done;
   };
 
   struct Writer {
@@ -197,62 +197,84 @@ class RBTree {
       // 1. get the estimated_less_bound.
       BatchWriteUnit write_unit(OperationType::INSERT, (void*)insert_node);
       write_unit.info.estimated_less_bound = findEstimatedLessBoundForWrite(insert_node->value());
-      // 2. preserve a writer position.
-      uint32_t curr_write_batch_info = curr_write_batch_info_.fetch_add(1U, std::memory_order_acq_rel);
-      // 3. parse the write batch id and writer_idx.
-      int curr_write_batch_id = (curr_write_batch_info >> 31);
-      int writer_idx = (curr_write_batch_info & ((1U << 31) - 1));
-      RB_ASSERT((curr_write_batch_id == 0 || curr_write_batch_id == 1) && writer_idx < WRITE_BATCH_MAX_SIZE);
-      Writer* writer = &(write_batch_addr_[curr_write_batch_id][writer_idx]);
-      RB_ASSERT(!writer->accessible.load() && writer->batch_unit == nullptr);
-      // 4. use write_unit to set writer's batch_unit and then make writer accessible for leader writer to execute true write operation.
-      writer->batch_unit = &write_unit;
-      writer->accessible.store(true, std::memory_order_release);
-      bool retry = false;
+      // // 2. preserve a writer position.
+      // uint32_t curr_write_batch_info = curr_write_batch_info_.fetch_add(1U, std::memory_order_acq_rel);
+      // // 3. parse the write batch id and writer_idx.
+      // int curr_write_batch_id = (curr_write_batch_info >> 31);
+      // int writer_idx = (curr_write_batch_info & ((1U << 31) - 1));
+      // RB_ASSERT((curr_write_batch_id == 0 || curr_write_batch_id == 1) && writer_idx < WRITE_BATCH_MAX_SIZE);
+      // Writer* writer = &(write_batch_addr_[curr_write_batch_id][writer_idx]);
+      // RB_ASSERT(!writer->accessible.load() && writer->batch_unit == nullptr);
+      // // 4. use write_unit to set writer's batch_unit and then make writer accessible for leader writer to execute true write operation.
+      // writer->batch_unit = &write_unit;
+      // writer->accessible.store(true, std::memory_order_release);
+      // bool retry = false;
       while (write_leader_flag_.test_and_set(std::memory_order_acquire)) {
-        // now we failed to get leader flag.
-        if (write_unit.done.load(std::memory_order_acquire)) {
-          // ! here curr thread is the follower thread in the writers_ queue, and write operation is done by leader thread.
-          if (write_unit.result.status == WriteStatus::RETRY) {
-            retry = true;
-            break;
-          } else {
-            if (write_unit.result.status == WriteStatus::ABORT) delete insert_node;
-            return write_unit.result.magic_node;
-          }
-        } else {
-          // sleep for a while.
-          // std::this_thread::sleep_for(std::chrono::nanoseconds(0));
+        // // now we failed to get leader flag.
+        // if (write_unit.done.load(std::memory_order_acquire)) {
+        //   // ! here curr thread is the follower thread in the writers_ queue, and write operation is done by leader thread.
+        //   if (write_unit.result.status == WriteStatus::RETRY) {
+        //     retry = true;
+        //     break;
+        //   } else {
+        //     if (write_unit.result.status == WriteStatus::ABORT) delete insert_node;
+        //     return write_unit.result.magic_node;
+        //   }
+        // } else {
+        //   // sleep for a while.
+        //   // std::this_thread::sleep_for(std::chrono::nanoseconds(0));
           std::this_thread::yield();
-        }
+        // }
       }
 
-      if (retry) {
-        // it means our job was done by leader and we should retry.
-        continue;
-      }
+      // if (retry) {
+      //   // it means our job was done by leader and we should retry.
+      //   continue;
+      // }
 
-      // ! here we got the leader flag but we still need to check if our job done or not.
-      if (write_unit.done.load(std::memory_order_acquire)) {
-        // ok, our job is done, it means curr thread is a follower.
-        write_leader_flag_.clear(std::memory_order_release);
-        if (write_unit.result.status == WriteStatus::RETRY) {
-          continue;
-        } else {
-          if (write_unit.result.status == WriteStatus::ABORT) delete insert_node;
-          return write_unit.result.magic_node;
-        }
-      }
+      // // ! here we got the leader flag but we still need to check if our job done or not.
+      // if (write_unit.done.load(std::memory_order_acquire)) {
+      //   // ok, our job is done, it means curr thread is a follower.
+      //   write_leader_flag_.clear(std::memory_order_release);
+      //   if (write_unit.result.status == WriteStatus::RETRY) {
+      //     continue;
+      //   } else {
+      //     if (write_unit.result.status == WriteStatus::ABORT) delete insert_node;
+      //     return write_unit.result.magic_node;
+      //   }
+      // }
 
       // ! here curr thread is the leader thread, execute write operation directly.
       // ! only one write thread could be here at the same time.
 
-      HANDLE_WRITE_BATCH();
+      // HANDLE_WRITE_BATCH();
+
+        BatchWriteUnit* write_unitt = &write_unit;
+        /* find the exact_less_bound as the insert position in the sorted-list according to estimated_less_bound */
+        Node* exact_less_bound = findExactLessBoundForWrite(write_unitt->info.estimated_less_bound, insert_node->value());
+        if (exact_less_bound == nullptr) {
+          /* 1. fail to find the insert position, retry */
+          write_unitt->result.status = WriteStatus::RETRY;
+        } else {
+          Node* no_less_bound = exact_less_bound->next();
+          if (no_less_bound == list_tailer_ || no_less_bound->value() > insert_node->value()) {
+            /* 2. insert_node's target_value doesn't exist, execute insert and return the insert_node */
+            internalInsert(insert_node, exact_less_bound);
+            write_unitt->result.status = WriteStatus::SUCCESS;
+            write_unitt->result.magic_node = insert_node;
+          } else {
+            /* 3. insert_node's target_value already exists, abort insert and return the existed node */
+            RB_ASSERT(no_less_bound->value() == insert_node->value());
+            write_unitt->result.status = WriteStatus::ABORT;
+            write_unitt->result.magic_node = no_less_bound;
+          }
+        }
+        // write_unitt->done.store(true, std::memory_order_release);
 
       write_leader_flag_.clear(std::memory_order_release);
 
       // handle leader's write result.
-      RB_ASSERT(write_unit.done.load(std::memory_order_acquire));
+      // RB_ASSERT(write_unit.done.load(std::memory_order_acquire));
       if (write_unit.result.status == WriteStatus::RETRY) {
         continue;
       } else {
@@ -268,66 +290,86 @@ class RBTree {
       // 1. get the estimated_less_bound.
       BatchWriteUnit write_unit(OperationType::ERASE, (void*)(&erase_value));
       write_unit.info.estimated_less_bound = findEstimatedLessBoundForWrite(erase_value);
-      // 2. preserve a writer position.
-      uint32_t curr_write_batch_info = curr_write_batch_info_.fetch_add(1U, std::memory_order_acq_rel);
-      // 3. parse the write batch id and writer_idx.
-      int curr_write_batch_id = (curr_write_batch_info >> 31);
-      int writer_idx = (curr_write_batch_info & ((1U << 31) - 1));
-      RB_ASSERT((curr_write_batch_id == 0 || curr_write_batch_id == 1) && writer_idx < WRITE_BATCH_MAX_SIZE);
-      Writer* writer = &(write_batch_addr_[curr_write_batch_id][writer_idx]);
-      RB_ASSERT(!writer->accessible.load() && writer->batch_unit == nullptr);
-      // 4. use write_unit to set writer's batch_unit and then make writer accessible for leader writer to execute true write operation.
-      writer->batch_unit = &write_unit;
-      writer->accessible.store(true, std::memory_order_release);
-      bool retry = false;
+      // // 2. preserve a writer position.
+      // uint32_t curr_write_batch_info = curr_write_batch_info_.fetch_add(1U, std::memory_order_acq_rel);
+      // // 3. parse the write batch id and writer_idx.
+      // int curr_write_batch_id = (curr_write_batch_info >> 31);
+      // int writer_idx = (curr_write_batch_info & ((1U << 31) - 1));
+      // RB_ASSERT((curr_write_batch_id == 0 || curr_write_batch_id == 1) && writer_idx < WRITE_BATCH_MAX_SIZE);
+      // Writer* writer = &(write_batch_addr_[curr_write_batch_id][writer_idx]);
+      // RB_ASSERT(!writer->accessible.load() && writer->batch_unit == nullptr);
+      // // 4. use write_unit to set writer's batch_unit and then make writer accessible for leader writer to execute true write operation.
+      // writer->batch_unit = &write_unit;
+      // writer->accessible.store(true, std::memory_order_release);
+      // bool retry = false;
       while (write_leader_flag_.test_and_set(std::memory_order_acquire)) {
-        // now we failed to get leader flag.
-        if (write_unit.done.load(std::memory_order_acquire)) {
-          // ! here curr thread is the follower thread in the writers_ queue, and write operation is done by leader thread.
-          if (write_unit.result.status == WriteStatus::RETRY) {
-            retry = true;
-            break;
-          } else if (write_unit.result.status == WriteStatus::ABORT) {
-            return false;
-          } else {
-            // erase success.
-            return true;
-          }
-        } else {
-          // sleep for a while.
-          // std::this_thread::sleep_for(std::chrono::nanoseconds(0));
+        // // now we failed to get leader flag.
+        // if (write_unit.done.load(std::memory_order_acquire)) {
+        //   // ! here curr thread is the follower thread in the writers_ queue, and write operation is done by leader thread.
+        //   if (write_unit.result.status == WriteStatus::RETRY) {
+        //     retry = true;
+        //     break;
+        //   } else if (write_unit.result.status == WriteStatus::ABORT) {
+        //     return false;
+        //   } else {
+        //     // erase success.
+        //     return true;
+        //   }
+        // } else {
+        //   // sleep for a while.
+        //   // std::this_thread::sleep_for(std::chrono::nanoseconds(0));
           std::this_thread::yield();
-        }
+        // }
       }
 
-      if (retry) {
-        // it means our job was done by leader and we should retry.
-        continue;
-      }
+      // if (retry) {
+      //   // it means our job was done by leader and we should retry.
+      //   continue;
+      // }
 
-      // ! here we got the leader flag but we still need to check if our job done or not.
-      if (write_unit.done.load(std::memory_order_acquire)) {
-        // ok, our job is done, it means curr thread is a follower.
-        write_leader_flag_.clear(std::memory_order_release);
-        if (write_unit.result.status == WriteStatus::RETRY) {
-          continue;
-        } else if (write_unit.result.status == WriteStatus::ABORT) {
-          return false;
-        } else {
-          // erase success.
-          return true;
-        }
-      }
+      // // ! here we got the leader flag but we still need to check if our job done or not.
+      // if (write_unit.done.load(std::memory_order_acquire)) {
+      //   // ok, our job is done, it means curr thread is a follower.
+      //   write_leader_flag_.clear(std::memory_order_release);
+      //   if (write_unit.result.status == WriteStatus::RETRY) {
+      //     continue;
+      //   } else if (write_unit.result.status == WriteStatus::ABORT) {
+      //     return false;
+      //   } else {
+      //     // erase success.
+      //     return true;
+      //   }
+      // }
 
       // ! here curr thread is the leader thread, execute write operation directly.
       // ! only one write thread could be here at the same time.
 
-      HANDLE_WRITE_BATCH();
+      // HANDLE_WRITE_BATCH();
+
+        BatchWriteUnit* write_unitt = &write_unit;
+        /* find the exact_less_bound as the erase position in the sorted-list according to estimated_less_bound */
+        Node* exact_less_bound = findExactLessBoundForWrite(write_unitt->info.estimated_less_bound, erase_value);
+        if (exact_less_bound == nullptr) {
+          /* 1. fail to find the erase position, retry */
+          write_unitt->result.status = WriteStatus::RETRY;
+        } else {
+          Node* no_less_bound = exact_less_bound->next();
+          if (no_less_bound == list_tailer_ || no_less_bound->value() > erase_value) {
+            /* 2. target_erase_value doesn't exist, abort erase */
+            write_unitt->result.status = WriteStatus::ABORT;
+          } else {
+            /* 3. target_erase_value exists, execute erase */
+            RB_ASSERT(no_less_bound->value() == erase_value);
+            internalErase(exact_less_bound);
+            write_unitt->result.status = WriteStatus::SUCCESS;
+          }
+        }
+        // write_unitt->done.store(true, std::memory_order_release);
 
       write_leader_flag_.clear(std::memory_order_release);
 
       // handle leader's write result.
-      RB_ASSERT(write_unit.done.load(std::memory_order_acquire));
+      // RB_ASSERT(write_unit.done.load(std::memory_order_acquire));
       if (write_unit.result.status == WriteStatus::RETRY) {
         continue;
       } else if (write_unit.result.status == WriteStatus::ABORT) {
