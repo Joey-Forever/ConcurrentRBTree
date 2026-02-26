@@ -7,6 +7,10 @@
 #include <random>
 #include <thread>
 #include <cassert>
+#include <deque>
+#include <iterator>
+#include <mutex>
+#include <memory>
 #include "/Users/caijiajian/Joey-Project-For-Linux/test_perf_dir/test_perf.h"
 
 #ifdef DEBUG
@@ -24,6 +28,9 @@ template <typename VALUE>
 class RBTree {
  public:
   class Node;
+  class NodeRecycler;
+  class iterator;
+  class Accessor;
   typedef Node* TreeRoot;
   typedef Node* Father;
   typedef Node* LeftSon;
@@ -32,6 +39,7 @@ class RBTree {
   typedef Node* ListTailer;
   typedef Node* ListNext;
 
+  // using RBTreeType = RBTree<VALUE>;
   using Side = typename Node::Side;
   using Color = typename Node::Color;
 
@@ -69,7 +77,7 @@ class RBTree {
     std::atomic<bool> accessible;
   };
 
- public:
+ private:
   RBTree() {
     // root_ is never accessible to the user of rbtree.
     root_ = new Node();
@@ -80,13 +88,23 @@ class RBTree {
     // 3. make list_header_ and list_tailer_ accessible.
     list_header_->setAccessibility(true);
     list_tailer_->setAccessibility(true);
-    // init the write batch memory block.
-    curr_write_batch_info_.store(0);
   }
 
+ public:
   ~RBTree() {
-    recursiveDestruction(root_);
+    recursiveDestruction(root_->leftSonNoBarrier());
+    delete list_header_;
+    delete list_tailer_;
+    delete root_;
   }
+
+  // caller only can use this static method to create a rbtree instance.
+  static std::shared_ptr<RBTree> createInstance() {
+    return std::shared_ptr<RBTree>(new RBTree());
+  }
+
+  size_t size() const { return size_.load(std::memory_order_relaxed); }
+  bool empty() const { return size() == 0; }
 
   // find the accessible node == value.
   Node* find(const VALUE& value) {
@@ -111,143 +129,18 @@ class RBTree {
     return lower_bound;
   }
 
-  // Macro to handle write batch - will be inlined at call site
-  #define HANDLE_WRITE_BATCH() \
-    do { \
-      /* reset the curr_write_batch_info_ */ \
-      uint32_t old_write_batch_info = curr_write_batch_info_.load(); \
-      int old_write_batch_id = (old_write_batch_info >> 31); \
-      if (old_write_batch_id == 0) { \
-        old_write_batch_info = curr_write_batch_info_.exchange(1U << 31, std::memory_order_acq_rel); \
-      } else { \
-        old_write_batch_info = curr_write_batch_info_.exchange(0, std::memory_order_acq_rel); \
-      } \
-      int old_write_batch_size = (old_write_batch_info & ((1U << 31) - 1)); \
-      RB_ASSERT((old_write_batch_id == 0 || old_write_batch_id == 1) && old_write_batch_size <= WRITE_BATCH_MAX_SIZE); \
-      Writer* old_write_batch_addr = write_batch_addr_[old_write_batch_id]; \
-      \
-      int erase_cnt = 0; \
-      for (int i = 0; i < old_write_batch_size; i++) { \
-        while(!old_write_batch_addr[i].accessible.load(std::memory_order_acquire)) {}  /* spin wait for accessible */ \
-        BatchWriteUnit* write_unitt = old_write_batch_addr[i].batch_unit; \
-        if (write_unitt->info.type == OperationType::ERASE) { \
-          tmp_array_for_handle_write_batch_[erase_cnt++] = i; \
-          continue; \
-        } \
-        Node* insert_node = (Node*)(write_unitt->info.data); \
-        /* find the exact_less_bound as the insert position in the sorted-list according to estimated_less_bound */ \
-        Node* exact_less_bound = findExactLessBoundForWrite(write_unitt->info.estimated_less_bound, insert_node->value()); \
-        if (exact_less_bound == nullptr) { \
-          /* 1. fail to find the insert position, retry */ \
-          write_unitt->result.status = WriteStatus::RETRY; \
-        } else { \
-          Node* no_less_bound = exact_less_bound->next(); \
-          if (no_less_bound == list_tailer_ || no_less_bound->value() > insert_node->value()) { \
-            /* 2. insert_node's target_value doesn't exist, execute insert and return the insert_node */ \
-            internalInsert(insert_node, exact_less_bound); \
-            write_unitt->result.status = WriteStatus::SUCCESS; \
-            write_unitt->result.magic_node = insert_node; \
-          } else { \
-            /* 3. insert_node's target_value already exists, abort insert and return the existed node */ \
-            RB_ASSERT(no_less_bound->value() == insert_node->value()); \
-            write_unitt->result.status = WriteStatus::ABORT; \
-            write_unitt->result.magic_node = no_less_bound; \
-          } \
-        } \
-        write_unitt->done.store(true, std::memory_order_release); \
-        /* reset the writer slot */ \
-        old_write_batch_addr[i].accessible.store(false, std::memory_order_release); \
-        old_write_batch_addr[i].batch_unit = nullptr; \
-      } \
-      \
-      for (int ii = 0; ii < erase_cnt; ii++) { \
-        int i = tmp_array_for_handle_write_batch_[ii]; \
-        BatchWriteUnit* write_unitt = old_write_batch_addr[i].batch_unit; \
-        VALUE* target_erase_value = (VALUE*)(write_unitt->info.data); \
-        /* find the exact_less_bound as the erase position in the sorted-list according to estimated_less_bound */ \
-        Node* exact_less_bound = findExactLessBoundForWrite(write_unitt->info.estimated_less_bound, *target_erase_value); \
-        if (exact_less_bound == nullptr) { \
-          /* 1. fail to find the erase position, retry */ \
-          write_unitt->result.status = WriteStatus::RETRY; \
-        } else { \
-          Node* no_less_bound = exact_less_bound->next(); \
-          if (no_less_bound == list_tailer_ || no_less_bound->value() > *target_erase_value) { \
-            /* 2. target_erase_value doesn't exist, abort erase */ \
-            write_unitt->result.status = WriteStatus::ABORT; \
-          } else { \
-            /* 3. target_erase_value exists, execute erase */ \
-            RB_ASSERT(no_less_bound->value() == *target_erase_value); \
-            internalErase(exact_less_bound); \
-            write_unitt->result.status = WriteStatus::SUCCESS; \
-          } \
-        } \
-        write_unitt->done.store(true, std::memory_order_release); \
-        /* reset the writer slot */ \
-        old_write_batch_addr[i].accessible.store(false, std::memory_order_release); \
-        old_write_batch_addr[i].batch_unit = nullptr; \
-      } \
-    } while (0)
-
   // the insert operation would be ignored if key exists and return the Node* to the existed value,
   // otherwise execute insertion firstly.
   template<typename U>
-  Node* insert(U&& insert_value) {
+  std::pair<Node*, bool> insert(U&& insert_value) {
     Node* insert_node = new Node(std::forward<U>(insert_value));
     while (true) {
       // 1. get the estimated_less_bound.
       BatchWriteUnit write_unit(OperationType::INSERT, (void*)insert_node);
       write_unit.info.estimated_less_bound = findEstimatedLessBoundForWrite(insert_node->value());
-      // // 2. preserve a writer position.
-      // uint32_t curr_write_batch_info = curr_write_batch_info_.fetch_add(1U, std::memory_order_acq_rel);
-      // // 3. parse the write batch id and writer_idx.
-      // int curr_write_batch_id = (curr_write_batch_info >> 31);
-      // int writer_idx = (curr_write_batch_info & ((1U << 31) - 1));
-      // RB_ASSERT((curr_write_batch_id == 0 || curr_write_batch_id == 1) && writer_idx < WRITE_BATCH_MAX_SIZE);
-      // Writer* writer = &(write_batch_addr_[curr_write_batch_id][writer_idx]);
-      // RB_ASSERT(!writer->accessible.load() && writer->batch_unit == nullptr);
-      // // 4. use write_unit to set writer's batch_unit and then make writer accessible for leader writer to execute true write operation.
-      // writer->batch_unit = &write_unit;
-      // writer->accessible.store(true, std::memory_order_release);
-      // bool retry = false;
       while (write_leader_flag_.test_and_set(std::memory_order_acquire)) {
-        // // now we failed to get leader flag.
-        // if (write_unit.done.load(std::memory_order_acquire)) {
-        //   // ! here curr thread is the follower thread in the writers_ queue, and write operation is done by leader thread.
-        //   if (write_unit.result.status == WriteStatus::RETRY) {
-        //     retry = true;
-        //     break;
-        //   } else {
-        //     if (write_unit.result.status == WriteStatus::ABORT) delete insert_node;
-        //     return write_unit.result.magic_node;
-        //   }
-        // } else {
-        //   // sleep for a while.
-        //   // std::this_thread::sleep_for(std::chrono::nanoseconds(0));
           std::this_thread::yield();
-        // }
       }
-
-      // if (retry) {
-      //   // it means our job was done by leader and we should retry.
-      //   continue;
-      // }
-
-      // // ! here we got the leader flag but we still need to check if our job done or not.
-      // if (write_unit.done.load(std::memory_order_acquire)) {
-      //   // ok, our job is done, it means curr thread is a follower.
-      //   write_leader_flag_.clear(std::memory_order_release);
-      //   if (write_unit.result.status == WriteStatus::RETRY) {
-      //     continue;
-      //   } else {
-      //     if (write_unit.result.status == WriteStatus::ABORT) delete insert_node;
-      //     return write_unit.result.magic_node;
-      //   }
-      // }
-
-      // ! here curr thread is the leader thread, execute write operation directly.
-      // ! only one write thread could be here at the same time.
-
-      // HANDLE_WRITE_BATCH();
 
         BatchWriteUnit* write_unitt = &write_unit;
         /* find the exact_less_bound as the insert position in the sorted-list according to estimated_less_bound */
@@ -269,17 +162,18 @@ class RBTree {
             write_unitt->result.magic_node = no_less_bound;
           }
         }
-        // write_unitt->done.store(true, std::memory_order_release);
 
       write_leader_flag_.clear(std::memory_order_release);
 
-      // handle leader's write result.
-      // RB_ASSERT(write_unit.done.load(std::memory_order_acquire));
       if (write_unit.result.status == WriteStatus::RETRY) {
         continue;
+      } else if (write_unit.result.status == WriteStatus::ABORT) {
+        delete insert_node;
+        return {write_unit.result.magic_node, false};
       } else {
-        if (write_unit.result.status == WriteStatus::ABORT) delete insert_node;
-        return write_unit.result.magic_node;
+        // insert success.
+        size_.fetch_add(1, std::memory_order_relaxed);
+        return {write_unit.result.magic_node, true};
       }
     }
   }
@@ -290,61 +184,9 @@ class RBTree {
       // 1. get the estimated_less_bound.
       BatchWriteUnit write_unit(OperationType::ERASE, (void*)(&erase_value));
       write_unit.info.estimated_less_bound = findEstimatedLessBoundForWrite(erase_value);
-      // // 2. preserve a writer position.
-      // uint32_t curr_write_batch_info = curr_write_batch_info_.fetch_add(1U, std::memory_order_acq_rel);
-      // // 3. parse the write batch id and writer_idx.
-      // int curr_write_batch_id = (curr_write_batch_info >> 31);
-      // int writer_idx = (curr_write_batch_info & ((1U << 31) - 1));
-      // RB_ASSERT((curr_write_batch_id == 0 || curr_write_batch_id == 1) && writer_idx < WRITE_BATCH_MAX_SIZE);
-      // Writer* writer = &(write_batch_addr_[curr_write_batch_id][writer_idx]);
-      // RB_ASSERT(!writer->accessible.load() && writer->batch_unit == nullptr);
-      // // 4. use write_unit to set writer's batch_unit and then make writer accessible for leader writer to execute true write operation.
-      // writer->batch_unit = &write_unit;
-      // writer->accessible.store(true, std::memory_order_release);
-      // bool retry = false;
       while (write_leader_flag_.test_and_set(std::memory_order_acquire)) {
-        // // now we failed to get leader flag.
-        // if (write_unit.done.load(std::memory_order_acquire)) {
-        //   // ! here curr thread is the follower thread in the writers_ queue, and write operation is done by leader thread.
-        //   if (write_unit.result.status == WriteStatus::RETRY) {
-        //     retry = true;
-        //     break;
-        //   } else if (write_unit.result.status == WriteStatus::ABORT) {
-        //     return false;
-        //   } else {
-        //     // erase success.
-        //     return true;
-        //   }
-        // } else {
-        //   // sleep for a while.
-        //   // std::this_thread::sleep_for(std::chrono::nanoseconds(0));
           std::this_thread::yield();
-        // }
       }
-
-      // if (retry) {
-      //   // it means our job was done by leader and we should retry.
-      //   continue;
-      // }
-
-      // // ! here we got the leader flag but we still need to check if our job done or not.
-      // if (write_unit.done.load(std::memory_order_acquire)) {
-      //   // ok, our job is done, it means curr thread is a follower.
-      //   write_leader_flag_.clear(std::memory_order_release);
-      //   if (write_unit.result.status == WriteStatus::RETRY) {
-      //     continue;
-      //   } else if (write_unit.result.status == WriteStatus::ABORT) {
-      //     return false;
-      //   } else {
-      //     // erase success.
-      //     return true;
-      //   }
-      // }
-
-      // ! here curr thread is the leader thread, execute write operation directly.
-      // ! only one write thread could be here at the same time.
-
-      // HANDLE_WRITE_BATCH();
 
         BatchWriteUnit* write_unitt = &write_unit;
         /* find the exact_less_bound as the erase position in the sorted-list according to estimated_less_bound */
@@ -364,18 +206,16 @@ class RBTree {
             write_unitt->result.status = WriteStatus::SUCCESS;
           }
         }
-        // write_unitt->done.store(true, std::memory_order_release);
 
       write_leader_flag_.clear(std::memory_order_release);
 
-      // handle leader's write result.
-      // RB_ASSERT(write_unit.done.load(std::memory_order_acquire));
       if (write_unit.result.status == WriteStatus::RETRY) {
         continue;
       } else if (write_unit.result.status == WriteStatus::ABORT) {
         return false;
       } else {
         // erase success.
+        size_.fetch_sub(1, std::memory_order_relaxed);
         return true;
       }
     }
@@ -410,31 +250,26 @@ class RBTree {
     return root_;
   }
 
-  Node* getTailer() {
-    return list_tailer_;
-  }
-
  private:
   static const int MAX_EXTRA_STEPS_FROM_NO_GREATER_BOUND_TO_LOWER_BOUND = 3;
-  static const size_t WRITE_BATCH_MAX_SIZE = 50;
   // no-data node, left son is the true data root.
   TreeRoot root_;
   // no-data list node, as the header of the sorted list for all data node.
   ListHeader list_header_;
   // no-data list node, as the tailer of the sorted list for all data node.
   ListTailer list_tailer_;
-  // used for leader write thread to execute true write operation.
-  // it's no need to be guarded by lock due to it's at most one leader write thread at the same time.
-  Writer write_batch_addr_[2][WRITE_BATCH_MAX_SIZE];
-  // top 1 bit means curr write batch id,
-  // low 31 bit means curr write batch size.
-  std::atomic<uint32_t> curr_write_batch_info_;
+  // a recycler for erase-nodes' GC in concurrent access cases.
+  Node* place_holder_1_[20];
+  NodeRecycler recycler_;
   // only the write thread who get this flag could execute true write operation.
-  std::atomic_flag write_leader_flag_ = ATOMIC_FLAG_INIT;
-  // an assistant array for HANDLE_WRITE_BATCH to seperate insert operations and erase operations.
-  int tmp_array_for_handle_write_batch_[WRITE_BATCH_MAX_SIZE];
+  Node* place_holder_2_[20];
+  alignas(64) std::atomic_flag write_leader_flag_ = ATOMIC_FLAG_INIT;
+  // total data size.
+  Node* place_holder_3_[20];
+  alignas(64) std::atomic<size_t> size_{0};
 
-  friend class Node;
+
+  void recycle(Node* node) { recycler_.add(node); }
 
   // recursive destruct a sub-tree whose root is curr_node.
   void recursiveDestruction(Node* curr_node) {
@@ -612,8 +447,8 @@ class RBTree {
         // ensure bro_of_delete_side must exist.
         balanceTheTreeAfterErase(father_of_erase_node, delete_side);
       }
-      // 5. finally delete erase_node.
-      // delete erase_node;
+      // 5. finally recycle erase_node.
+      recycle(erase_node);
     } else {
       // erase_node is a non-leaf node with two son.
 
@@ -648,8 +483,8 @@ class RBTree {
         father_of_erase_node->leftSonNoBarrier() == erase_node ? Node::LEFT : Node::RIGHT, right_most_node);
       // 6. detach erase_node from sorted-list.
       right_most_node->setNext(erase_node->next());
-      // 7. finally delete erase_node.
-      // delete erase_node;
+      // 7. finally recycle erase_node.
+      recycle(erase_node);
     }
   }
 
@@ -804,33 +639,30 @@ class RBTree {
   }
 };
 
-static RBTree<int>* g_rbtree;
-
 template <typename VALUE>
 class RBTree<VALUE>::Node {
  public:
   enum Side { RIGHT, LEFT };
-  enum Color { RED, BLACK };
+  enum Color: uint8_t { RED, BLACK };
 
+  // constructor for sentinel nodes, like root_, list_header_ and list_tailer_.
   explicit Node()
     : value_(), accessible_(false),
+      is_sentinel_node_(true),
       father_(nullptr), left_son_(nullptr),
       right_son_(nullptr), next_(nullptr) {}
 
+  // constructor for data nodes.
   template<typename U>
   explicit Node(U&& value)
     : value_(std::forward<U>(value)), accessible_(false),
+      is_sentinel_node_(false),
       father_(nullptr), left_son_(nullptr),
       right_son_(nullptr), next_(nullptr) {}
 
   // when a node is going to be destructed, caller MUST make sure firstly that the node
   // is detached from rbtree and that the list-node is detached from sorted list.
-  ~Node() {
-    father_ = nullptr;
-    left_son_.store(nullptr);
-    right_son_.store(nullptr);
-    next_.store(nullptr);
-  }
+  ~Node() = default;
 
   static void SwapColor(Node* node1, Node* node2) {
     if (node1 != nullptr && node2 != nullptr) {
@@ -839,7 +671,12 @@ class RBTree<VALUE>::Node {
   }
 
   inline VALUE& value() {
-    RB_ASSERT(this != g_rbtree->list_header_ && this != g_rbtree->list_tailer_);
+    RB_ASSERT(!is_sentinel_node_);
+    return value_;
+  }
+
+  inline const VALUE& value() const {
+    RB_ASSERT(!is_sentinel_node_);
     return value_;
   }
 
@@ -883,6 +720,19 @@ class RBTree<VALUE>::Node {
     return next_.load(std::memory_order_acquire);
   }
 
+  // for caller to find the next accessible data node.
+  // return nullptr if next accessible data node is not existed.
+  inline Node* accessibleNext() const {
+    Node* next_node = next();
+    while(!next_node->is_sentinel_node_ && !next_node->accessible()) {
+      next_node = next_node->next();
+    }
+    if (next_node->is_sentinel_node_) {
+      return nullptr;
+    }
+    return next_node;
+  }
+
   inline void setNext(ListNext new_next) {
     next_.store(new_next, std::memory_order_release);
   }
@@ -896,6 +746,7 @@ class RBTree<VALUE>::Node {
   VALUE value_;
   Color color_;
   std::atomic<bool> accessible_; // whether the node is accessible to the user of rbtree.
+  const bool is_sentinel_node_;
 
   // pointer region
   Father father_; // ! only used for write case's upward balance.
@@ -905,11 +756,240 @@ class RBTree<VALUE>::Node {
 
 };
 
+// inspired by folly::ConcurrentSkipList.
+template <typename VALUE>
+class RBTree<VALUE>::NodeRecycler {
+ public:
+  explicit NodeRecycler() : refs_(0), dirty_(false) {}
+
+  ~NodeRecycler() {
+    RB_ASSERT(refs() == 0);
+    if (nodes_) {
+      for (auto& node : *nodes_) {
+        delete node;
+      }
+    }
+  }
+
+  void add(Node* node) {
+    std::lock_guard<std::mutex> g(lock_);
+    if (nodes_.get() == nullptr) {
+      nodes_ = std::make_unique<std::vector<Node*>>(1, node);
+    } else {
+      nodes_->push_back(node);
+    }
+    RB_ASSERT(refs() > 0);
+    dirty_.store(true, std::memory_order_relaxed);
+  }
+
+  int addRef() { return refs_.fetch_add(1, std::memory_order_acq_rel); }
+
+  int releaseRef() {
+    // This if statement is purely an optimization. It's possible that this
+    // misses an opportunity to delete, but that's OK, we'll try again at
+    // the next opportunity. It does not harm the thread safety. For this
+    // reason, we can use relaxed loads to make the decision.
+    if (!dirty_.load(std::memory_order_relaxed) || refs() > 1) {
+      return refs_.fetch_add(-1, std::memory_order_acq_rel);
+    }
+
+    std::unique_ptr<std::vector<Node*>> newNodes;
+    int ret;
+    {
+      // The order at which we lock, add, swap, is very important for
+      // correctness.
+      std::lock_guard<std::mutex> g(lock_);
+      ret = refs_.fetch_add(-1, std::memory_order_acq_rel);
+      if (ret == 1) {
+        // When releasing the last reference, it is safe to remove all the
+        // current nodes in the recycler, as we already acquired the lock here
+        // so no more new nodes can be added, even though new accessors may be
+        // added after this.
+        newNodes.swap(nodes_);
+        dirty_.store(false, std::memory_order_relaxed);
+      }
+    }
+    // TODO(Joey) should we spawn a thread to do this when there are large
+    // number of nodes in the recycler?
+    if (newNodes) {
+      for (auto& node : *newNodes) {
+        delete node;
+      }
+    }
+    return ret;
+  }
+
+ private:
+  int refs() const { return refs_.load(std::memory_order_relaxed); }
+
+  std::unique_ptr<std::vector<Node*>> nodes_;
+  std::atomic<int32_t> refs_; // current number of visitors to the list
+  std::atomic<bool> dirty_; // whether *nodes_ is non-empty
+  std::mutex lock_; // protects access to *nodes_
+};
+
+// Forward iterator for RBTree, following folly::ConcurrentSkipList::iterator interface
+template <typename VALUE>
+class RBTree<VALUE>::iterator {
+ public:
+  using value_type = VALUE;
+  using reference = value_type&;
+  using pointer = value_type*;
+  using difference_type = std::ptrdiff_t;
+  using iterator_category = std::forward_iterator_tag;
+
+  // Default constructor - creates an end iterator
+  explicit iterator(Node* node = nullptr) : node_(node) {}
+
+  // Copy constructor
+  iterator(const iterator& other) : node_(other.node_) {}
+
+  // Assignment operator
+  iterator& operator=(const iterator& other) {
+    if (this != &other) {
+      node_ = other.node_;
+    }
+    return *this;
+  }
+
+  // Destructor
+  ~iterator() = default;
+
+  // Prefix increment
+  iterator& operator++() {
+    if (node_ != nullptr) {
+      // Use accessibleNext() for range iteration as specified
+      // This skips to the next accessible data node
+      node_ = node_->accessibleNext();
+    }
+    return *this;
+  }
+
+  // Postfix increment
+  iterator operator++(int) {
+    iterator tmp = *this;
+    ++(*this);
+    return tmp;
+  }
+
+  // Dereference operator
+  reference operator*() const {
+    // RBTree node uses value() method which maps to SkipList's data()
+    return node_->value();
+  }
+
+  // Arrow operator
+  pointer operator->() const {
+    return &(operator*());
+  }
+
+  // Equality comparison
+  bool operator==(const iterator& other) const {
+    return node_ == other.node_;
+  }
+
+  // Inequality comparison
+  bool operator!=(const iterator& other) const {
+    return !(*this == other);
+  }
+
+  // Returns the size of the node in bytes
+  // Note: RBTree nodes don't have a height() method like SkipList nodes
+  // This is a rough approximation based on node structure
+  size_t nodeSize() const {
+    if (node_ == nullptr) {
+      return 0;
+    }
+    // RBTree node size approximation
+    // Node contains: value_, color_, accessible_, is_sentinel_node_,
+    // father_, left_son_, right_son_, next_
+    return sizeof(Node);
+  }
+
+ private:
+  Node* node_;
+};
+
+// inspired by folly::ConcurrentSkipList::Accessor.
+template <typename VALUE>
+class RBTree<VALUE>::Accessor {
+ public:
+  // using RBTreeType = RBTree<VALUE>;
+  using value_type = VALUE;
+
+  explicit Accessor(std::shared_ptr<RBTree> rbtree)
+      : rbTreeHolder_(std::move(rbtree)) {
+    rbtree_ = rbTreeHolder_.get();
+    RB_ASSERT(rbtree_ != nullptr);
+    rbtree_->recycler_.addRef();
+  }
+
+  // Unsafe initializer: the caller assumes the responsibility to keep
+  // rbtree valid during the whole life cycle of the Accessor.
+  explicit Accessor(RBTree* rbtree) : rbtree_(rbtree) {
+    RB_ASSERT(rbtree_ != nullptr);
+    rbtree_->recycler_.addRef();
+  }
+
+  Accessor(const Accessor& accessor)
+      : rbtree_(accessor.rbtree_), rbTreeHolder_(accessor.rbTreeHolder_) {
+    rbtree_->recycler_.addRef();
+  }
+
+  Accessor& operator=(const Accessor& accessor) {
+    if (this != &accessor) {
+      rbTreeHolder_ = accessor.rbTreeHolder_;
+      rbtree_->recycler_.releaseRef();
+      rbtree_ = accessor.rbtree_;
+      rbtree_->recycler_.addRef();
+    }
+    return *this;
+  }
+
+  ~Accessor() { rbtree_->recycler_.releaseRef(); }
+
+  bool empty() const { return rbtree_->empty(); }
+  size_t size() const { return rbtree_->size(); }
+  size_t max_size() const { return std::numeric_limits<size_t>::max(); }
+
+  // returns end() if the value is not in the rbtree, otherwise returns an
+  // iterator pointing to the data, and it's guaranteed that the data is valid
+  // as far as the Accessor is hold.
+  iterator find(const value_type& value) { return iterator(rbtree_->find(value)); }
+  size_t count(const value_type& data) const { return find(data) != end(); }
+
+  iterator begin() const { return iterator(rbtree_->list_header_->accessibleNext()); }
+  iterator end() const { return iterator(nullptr); }
+
+  // TODO(Joey): implement const_iterator.
+  // const_iterator find(const value_type& value) const {
+  //   return iterator(rbtree_->find(value));
+  // }
+  // const_iterator cbegin() const { return begin(); }
+  // const_iterator cend() const { return end(); }
+
+  template <typename U>
+  std::pair<iterator, bool> insert(U&& data) {
+    auto ret = rbtree_->insert(std::forward<U>(data));
+    return {iterator(ret.first), ret.second};
+  }
+  size_t erase(const value_type& data) { return rbtree_->erase(data); }
+
+  iterator lower_bound(const value_type& data) const {
+    return iterator(rbtree_->lowerBound(data));
+  }
+
+  RBTree* raw_rbtree() const { return rbtree_; }
+
+ private:
+  RBTree* rbtree_;
+  std::shared_ptr<RBTree> rbTreeHolder_;
+};
+
 static void TestSingleThreadAbility(bool sequential_insert) {
   std::cout << "------------------------------------------------------------------------------------------------" << "\n";
   std::cout << "single thread test (sequential_insert = " << (sequential_insert ? "true" : "false") << "):\n";
-  RBTree<int> my_map;
-  g_rbtree = &my_map;
+  RBTree<int>::Accessor accessor(RBTree<int>::createInstance());
   int times = 100;
   std::deque<int> vec_for_map;
   int max_val = 0;
@@ -921,23 +1001,23 @@ static void TestSingleThreadAbility(bool sequential_insert) {
       int a;
       if (!sequential_insert) a = dis(gen);
       else a = max_val++;
-      if (my_map.find(a) != nullptr) i--;
-      else my_map.insert(a), vec_for_map.push_back(a);
+      if (accessor.find(a) != accessor.end()) i--;
+      else accessor.insert(a), vec_for_map.push_back(a);
     }
-    my_map.checkIfSortedListValidForTest();
+    accessor.raw_rbtree()->checkIfSortedListValidForTest();
     int newest_max_height = INT32_MIN;
     int newest_min_height = INT32_MAX;
     int node_count = 0;
-    my_map.getHeightInfoForTest(my_map.getRootForTest(), 0, newest_max_height, newest_min_height, node_count);
+    accessor.raw_rbtree()->getHeightInfoForTest(accessor.raw_rbtree()->getRootForTest(), 0, newest_max_height, newest_min_height, node_count);
     std::cout << newest_max_height << " " << newest_min_height << " " << node_count - 1 << "\n";
     for (int i = 0; i < 128 * 1024; i++) {
-      if (!my_map.erase(vec_for_map.front())) i--;
+      if (accessor.erase(vec_for_map.front()) == 0) i--;
       else vec_for_map.pop_front();
     }
     newest_max_height = INT32_MIN;
     newest_min_height = INT32_MAX;
     node_count = 0;
-    my_map.getHeightInfoForTest(my_map.getRootForTest(), 0, newest_max_height, newest_min_height, node_count);
+    accessor.raw_rbtree()->getHeightInfoForTest(accessor.raw_rbtree()->getRootForTest(), 0, newest_max_height, newest_min_height, node_count);
     std::cout << newest_max_height << " " << newest_min_height << " " << node_count - 1 << "\n";
     std::cout << "\n";
   }
@@ -946,12 +1026,11 @@ static void TestSingleThreadAbility(bool sequential_insert) {
 static void TestMultiWriteConcurrentPerf() {
   std::cout << "------------------------------------------------------------------------------------------------" << "\n";
   std::cout << "concurrent test --- multi write" << "\n";
-  RBTree<int> my_map;
-  g_rbtree = &my_map;
+  RBTree<int>::Accessor accessor(RBTree<int>::createInstance());
 
   std::set<int> std_set;
 
-  const int WRITE_THREAD_COUNT = 10;
+  const int WRITE_THREAD_COUNT = 8;
   const int BATCH_SIZE_PER_THREAD = 1000;
   const int ELEMENT_SIZE_PER_BATCH = 1000;
   const int BATCH_SIZE_FOR_INIT_DATA = 50;
@@ -986,7 +1065,7 @@ static void TestMultiWriteConcurrentPerf() {
   for (int i = 0; i < init_data.size(); i++) {
     const std::vector<int>& batch_data = init_data[i];
     for (int ele: batch_data) {
-      my_map.insert(ele);
+      accessor.insert(ele);
     }
   }
   auto gen_a_thread_data = [&gen_a_batch, BATCH_SIZE_PER_THREAD]() -> std::vector<std::vector<int>> {
@@ -1001,7 +1080,7 @@ static void TestMultiWriteConcurrentPerf() {
     thread_datas.push_back(gen_a_thread_data());
   }
   std::atomic<int> thread_idx(0);
-  auto write_ope = [&my_map, &thread_idx, &thread_datas]() {
+  auto write_ope = [&accessor, &thread_idx, &thread_datas]() {
     int idx = thread_idx.fetch_add(+1);
     RB_ASSERT(idx < thread_datas.size());
     const std::vector<std::vector<int>>& my_data = thread_datas[idx];
@@ -1009,25 +1088,25 @@ static void TestMultiWriteConcurrentPerf() {
       const std::vector<int>& batch_data = my_data[i];
       // 1. insert the batch data.
       for (int ele: batch_data) {
-        my_map.insert(ele);
+        accessor.insert(ele);
         // std_set.insert(ele);
       }
-      // // 2. find the insert batch data.
-      // for (int ele: batch_data) {
-      //   auto result = my_map.find(ele);
-      //   RB_ASSERT(result != nullptr && result->value() == ele);
-      // }
+      // 2. find the insert batch data.
+      for (int ele: batch_data) {
+        auto result = accessor.find(ele);
+        RB_ASSERT(result != accessor.end() && *result == ele);
+      }
       // 3. erase 1 batch every 2 batches.
       if (i % 2 == 0) {
         for (int ele: batch_data) {
-          my_map.erase(ele);
+          accessor.erase(ele);
           // std_set.erase(ele);
         }
-        // // find again.
-        // for (int ele: batch_data) {
-        //   auto result = my_map.find(ele);
-        //   RB_ASSERT(result == nullptr);
-        // }
+        // find again.
+        for (int ele: batch_data) {
+          auto result = accessor.find(ele);
+          RB_ASSERT(result == accessor.end());
+        }
       }
     }
   };
@@ -1045,11 +1124,11 @@ static void TestMultiWriteConcurrentPerf() {
   int time = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
   std::cout << "thread count = " << WRITE_THREAD_COUNT << ", total time = " << time << " ms, time per thread = " << time * 1.0 / WRITE_THREAD_COUNT << " ms."<< "\n";
 
-  my_map.checkIfSortedListValidForTest();
+  accessor.raw_rbtree()->checkIfSortedListValidForTest();
   int newest_max_height = INT32_MIN;
   int newest_min_height = INT32_MAX;
   int node_count = 0;
-  my_map.getHeightInfoForTest(my_map.getRootForTest(), 0, newest_max_height, newest_min_height, node_count);
+  accessor.raw_rbtree()->getHeightInfoForTest(accessor.raw_rbtree()->getRootForTest(), 0, newest_max_height, newest_min_height, node_count);
   std::cout << newest_max_height << " " << newest_min_height << " " << node_count - 1 << "\n";
 }
 
@@ -1067,8 +1146,15 @@ int main() {
   // RB_ASSERT(false);
   // TestSingleThreadAbility(false);
   // TestSingleThreadAbility(true);
-  TestMultiWriteConcurrentPerf();
-  // TestMultiReadFewWriteConcurrentPerf<RBTree<int>>([]() {
+  // TestMultiWriteConcurrentPerf();
+  // TestCacheMissRatePerf<RBTree<int>>([]() {
   //   return std::make_unique<RBTree<int>>();
-  // });
+  // }, "RBTree");
+  // TestJoeyDataPerf<RBTree<int>>([]() {
+  //   return std::make_unique<RBTree<int>>();
+  // }, "RBTree");
+  TestMultiReadFewWriteConcurrentPerf<RBTree<int>::Accessor>([]() {
+    auto rbtree = RBTree<int>::createInstance();
+    return std::make_unique<RBTree<int>::Accessor>(rbtree);
+  });
 }
