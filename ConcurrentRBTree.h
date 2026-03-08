@@ -1,3 +1,5 @@
+#pragma once
+
 #include <iostream>
 #include <vector>
 #include <atomic>
@@ -19,12 +21,14 @@
     #define RB_ASSERT(condition) do { } while (false)
 #endif
 
+namespace gipsy_danger {
+
 // single thread rbtree.
 // type KEY must implement operator< and operator==.
 // type KEY and type VALUE must define default constructor.
 // type VALUE must define move constructor.
 template <typename VALUE>
-class RBTree {
+class ConcurrentRBTree {
  public:
   class Node;
   class NodeRecycler;
@@ -38,7 +42,6 @@ class RBTree {
   typedef Node* ListTailer;
   typedef Node* ListNext;
 
-  // using RBTreeType = RBTree<VALUE>;
   using Side = typename Node::Side;
   using Color = typename Node::Color;
 
@@ -77,7 +80,7 @@ class RBTree {
   };
 
  private:
-  RBTree() {
+  ConcurrentRBTree() {
     // root_ is never accessible to the user of rbtree.
     root_ = new Node();
     list_header_ = new Node();
@@ -90,7 +93,7 @@ class RBTree {
   }
 
  public:
-  ~RBTree() {
+  ~ConcurrentRBTree() {
     recursiveDestruction(root_->leftSonNoBarrier());
     delete list_header_;
     delete list_tailer_;
@@ -98,8 +101,8 @@ class RBTree {
   }
 
   // caller only can use this static method to create a rbtree instance.
-  static std::shared_ptr<RBTree> createInstance() {
-    return std::shared_ptr<RBTree>(new RBTree());
+  static std::shared_ptr<ConcurrentRBTree> createInstance() {
+    return std::shared_ptr<ConcurrentRBTree>(new ConcurrentRBTree());
   }
 
   size_t size() const { return size_.load(std::memory_order_relaxed); }
@@ -639,7 +642,7 @@ class RBTree {
 };
 
 template <typename VALUE>
-class RBTree<VALUE>::Node {
+class ConcurrentRBTree<VALUE>::Node {
  public:
   enum Side { RIGHT, LEFT };
   enum Color: uint8_t { RED, BLACK };
@@ -757,7 +760,7 @@ class RBTree<VALUE>::Node {
 
 // inspired by folly::ConcurrentSkipList.
 template <typename VALUE>
-class RBTree<VALUE>::NodeRecycler {
+class ConcurrentRBTree<VALUE>::NodeRecycler {
  public:
   explicit NodeRecycler() : refs_(0), dirty_(false) {}
 
@@ -827,9 +830,9 @@ class RBTree<VALUE>::NodeRecycler {
   std::mutex lock_; // protects access to *nodes_
 };
 
-// Forward iterator for RBTree, following folly::ConcurrentSkipList::iterator interface
+// Forward iterator for ConcurrentRBTree, following folly::ConcurrentSkipList::iterator interface
 template <typename VALUE>
-class RBTree<VALUE>::iterator {
+class ConcurrentRBTree<VALUE>::iterator {
  public:
   using value_type = VALUE;
   using reference = value_type&;
@@ -911,12 +914,11 @@ class RBTree<VALUE>::iterator {
 
 // inspired by folly::ConcurrentSkipList::Accessor.
 template <typename VALUE>
-class RBTree<VALUE>::Accessor {
+class ConcurrentRBTree<VALUE>::Accessor {
  public:
-  // using RBTreeType = RBTree<VALUE>;
   using value_type = VALUE;
 
-  explicit Accessor(std::shared_ptr<RBTree> rbtree)
+  explicit Accessor(std::shared_ptr<ConcurrentRBTree> rbtree)
       : rbTreeHolder_(std::move(rbtree)) {
     rbtree_ = rbTreeHolder_.get();
     RB_ASSERT(rbtree_ != nullptr);
@@ -925,7 +927,7 @@ class RBTree<VALUE>::Accessor {
 
   // Unsafe initializer: the caller assumes the responsibility to keep
   // rbtree valid during the whole life cycle of the Accessor.
-  explicit Accessor(RBTree* rbtree) : rbtree_(rbtree) {
+  explicit Accessor(ConcurrentRBTree* rbtree) : rbtree_(rbtree) {
     RB_ASSERT(rbtree_ != nullptr);
     rbtree_->recycler_.addRef();
   }
@@ -978,9 +980,11 @@ class RBTree<VALUE>::Accessor {
     return iterator(rbtree_->lowerBound(data));
   }
 
-  RBTree* raw_rbtree() const { return rbtree_; }
+  ConcurrentRBTree* raw_rbtree() const { return rbtree_; }
 
  private:
-  RBTree* rbtree_;
-  std::shared_ptr<RBTree> rbTreeHolder_;
+  ConcurrentRBTree* rbtree_;
+  std::shared_ptr<ConcurrentRBTree> rbTreeHolder_;
 };
+
+} // namespace gipsy_danger
