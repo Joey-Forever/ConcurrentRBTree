@@ -988,3 +988,5 @@ class ConcurrentRBTree<VALUE>::Accessor {
 };
 
 } // namespace gipsy_danger
+
+#undef RB_ASSERT
