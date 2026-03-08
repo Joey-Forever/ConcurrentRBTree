@@ -13,7 +13,7 @@
 #include <memory>
 #include "/Users/caijiajian/Joey-Project-For-Linux/test_perf_dir/test_perf.h"
 
-#ifdef DEBUG
+#ifndef NDEBUG
     #define RB_ASSERT(condition) \
         do { assert(condition); } while (false)
 #else
@@ -1133,11 +1133,11 @@ static void TestMultiWriteConcurrentPerf() {
 }
 
 static void checkCompileMode() {
-#if defined(DEBUG)
+#ifndef NDEBUG
   std::cout << "DEBUG MODE" << "\n";
 #else
   std::cout << "PERF MODE" << "\n";
-#endif // DEBUG
+#endif // NDEBUG
 }
 
 int main() {
