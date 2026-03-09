@@ -1,5 +1,5 @@
 /*
- * Edge Case and Concurrency Stress Test for RBTree
+ * Edge Case and Concurrency Stress Test for ConcurrentRBTree
  * Tests scenarios that are easy to miss in standard testing
  */
 
@@ -13,13 +13,13 @@
 #include <cassert>
 #include <algorithm>
 
-#include "../rbtree.h"
+#include <ConcurrentRBTree.h>
 
 namespace {
 
 using ValueType = int;
-using RBTreeType = RBTree<ValueType>;
-using RBTreeAccessor = RBTreeType::Accessor;
+using ConcurrentRBTreeType = gipsy_danger::ConcurrentRBTree<ValueType>;
+using ConcurrentRBTreeAccessor = ConcurrentRBTreeType::Accessor;
 
 //=============================================================================
 // Test 1: High Contention - Multiple threads operating on SAME key
@@ -28,8 +28,8 @@ using RBTreeAccessor = RBTreeType::Accessor;
 bool testHighContention() {
     std::cout << "\n=== Test: HighContention (Same Key Races) ===" << std::endl;
 
-    auto rbtree = RBTreeType::createInstance();
-    RBTreeAccessor accessor(rbtree);
+    auto rbtree = ConcurrentRBTreeType::createInstance();
+    ConcurrentRBTreeAccessor accessor(rbtree);
 
     const int numThreads = 16;
     const int numOpsPerThread = 10000;
@@ -103,8 +103,8 @@ bool testInsertEraseFindRace() {
     const int targetValue = 999;
 
     for (int iter = 0; iter < numIterations; ++iter) {
-        auto rbtree = RBTreeType::createInstance();
-        RBTreeAccessor accessor(rbtree);
+        auto rbtree = ConcurrentRBTreeType::createInstance();
+        ConcurrentRBTreeAccessor accessor(rbtree);
 
         // Pre-insert the value
         accessor.insert(targetValue);
@@ -163,17 +163,17 @@ bool testInsertEraseFindRace() {
 bool testNodeRecyclerSafety() {
     std::cout << "\n=== Test: NodeRecyclerSafety ===" << std::endl;
 
-    auto rbtree = RBTreeType::createInstance();
+    auto rbtree = ConcurrentRBTreeType::createInstance();
 
     // Create multiple accessors
-    std::vector<std::shared_ptr<RBTreeAccessor>> accessors;
+    std::vector<std::shared_ptr<ConcurrentRBTreeAccessor>> accessors;
 
     const int numAccessors = 10;
     const int numElementsPerAccessor = 100;
 
     // Each accessor inserts elements
     for (int i = 0; i < numAccessors; ++i) {
-        auto acc = std::make_shared<RBTreeAccessor>(rbtree);
+        auto acc = std::make_shared<ConcurrentRBTreeAccessor>(rbtree);
         for (int j = 0; j < numElementsPerAccessor; ++j) {
             acc->insert(i * numElementsPerAccessor + j);
         }
@@ -201,7 +201,7 @@ bool testNodeRecyclerSafety() {
     }
 
     // Final accessor should see consistent state
-    RBTreeAccessor final_acc(rbtree);
+    ConcurrentRBTreeAccessor final_acc(rbtree);
     for (auto it = final_acc.begin(); it != final_acc.end(); ++it) {
         // Just verify no crash
     }
@@ -217,8 +217,8 @@ bool testNodeRecyclerSafety() {
 bool testIteratorSafetyDuringModification() {
     std::cout << "\n=== Test: IteratorSafetyDuringModification ===" << std::endl;
 
-    auto rbtree = RBTreeType::createInstance();
-    RBTreeAccessor accessor(rbtree);
+    auto rbtree = ConcurrentRBTreeType::createInstance();
+    ConcurrentRBTreeAccessor accessor(rbtree);
 
     // Pre-populate
     const int numElements = 10000;
@@ -292,8 +292,8 @@ bool testIteratorSafetyDuringModification() {
 bool testEmptyAndSingleElement() {
     std::cout << "\n=== Test: EmptyAndSingleElement ===" << std::endl;
 
-    auto rbtree = RBTreeType::createInstance();
-    RBTreeAccessor accessor(rbtree);
+    auto rbtree = ConcurrentRBTreeType::createInstance();
+    ConcurrentRBTreeAccessor accessor(rbtree);
 
     // Test empty tree
     assert(accessor.empty());
@@ -352,8 +352,8 @@ bool testEmptyAndSingleElement() {
 bool testMemoryOrdering() {
     std::cout << "\n=== Test: MemoryOrdering ===" << std::endl;
 
-    auto rbtree = RBTreeType::createInstance();
-    RBTreeAccessor accessor(rbtree);
+    auto rbtree = ConcurrentRBTreeType::createInstance();
+    ConcurrentRBTreeAccessor accessor(rbtree);
 
     const int numValues = 1000;
     const int numReaders = 8;
@@ -428,8 +428,8 @@ bool testMemoryOrdering() {
 bool testRapidInsertEraseInsert() {
     std::cout << "\n=== Test: RapidInsertEraseInsert ===" << std::endl;
 
-    auto rbtree = RBTreeType::createInstance();
-    RBTreeAccessor accessor(rbtree);
+    auto rbtree = ConcurrentRBTreeType::createInstance();
+    ConcurrentRBTreeAccessor accessor(rbtree);
 
     const int targetValue = 777;
     const int numIterations = 10000;
@@ -480,8 +480,8 @@ bool testRapidInsertEraseInsert() {
 bool testConcurrentSizeAccuracy() {
     std::cout << "\n=== Test: ConcurrentSizeAccuracy ===" << std::endl;
 
-    auto rbtree = RBTreeType::createInstance();
-    RBTreeAccessor accessor(rbtree);
+    auto rbtree = ConcurrentRBTreeType::createInstance();
+    ConcurrentRBTreeAccessor accessor(rbtree);
 
     const int numThreads = 8;
     const int numOpsPerThread = 1000;
@@ -536,7 +536,7 @@ bool testConcurrentSizeAccuracy() {
 bool testRecyclerUnderPressure() {
     std::cout << "\n=== Test: RecyclerUnderPressure ===" << std::endl;
 
-    auto rbtree = RBTreeType::createInstance();
+    auto rbtree = ConcurrentRBTreeType::createInstance();
 
     const int numCycles = 1000;
     const int numElementsPerCycle = 100;
@@ -544,7 +544,7 @@ bool testRecyclerUnderPressure() {
     for (int cycle = 0; cycle < numCycles; ++cycle) {
         // Create accessor, insert elements
         {
-            RBTreeAccessor accessor(rbtree);
+            ConcurrentRBTreeAccessor accessor(rbtree);
             for (int i = 0; i < numElementsPerCycle; ++i) {
                 accessor.insert(cycle * numElementsPerCycle + i);
             }
@@ -555,7 +555,7 @@ bool testRecyclerUnderPressure() {
         }  // Accessor destroyed here, potential recycling
 
         // Create new accessor and verify
-        RBTreeAccessor accessor2(rbtree);
+        ConcurrentRBTreeAccessor accessor2(rbtree);
         int count = 0;
         for (auto it = accessor2.begin(); it != accessor2.end(); ++it) {
             count++;
@@ -563,7 +563,7 @@ bool testRecyclerUnderPressure() {
         (void)count;
     }
 
-    RBTreeAccessor final_accessor(rbtree);
+    ConcurrentRBTreeAccessor final_accessor(rbtree);
     std::cout << "  Final tree size: " << final_accessor.size() << std::endl;
 
     std::cout << "  RecyclerUnderPressure test PASSED" << std::endl;
@@ -577,8 +577,8 @@ bool testRecyclerUnderPressure() {
 bool testSmallValueRangeStress() {
     std::cout << "\n=== Test: SmallValueRangeStress ===" << std::endl;
 
-    auto rbtree = RBTreeType::createInstance();
-    RBTreeAccessor accessor(rbtree);
+    auto rbtree = ConcurrentRBTreeType::createInstance();
+    ConcurrentRBTreeAccessor accessor(rbtree);
 
     const int numThreads = 16;
     const int numOpsPerThread = 10000;
@@ -637,7 +637,7 @@ bool testSmallValueRangeStress() {
 
 int main(int argc, char* argv[]) {
     std::cout << "==================================================" << std::endl;
-    std::cout << "  RBTree Edge Case & Concurrency Stress Tests" << std::endl;
+    std::cout << "  ConcurrentRBTree Edge Case & Concurrency Stress Tests" << std::endl;
     std::cout << "==================================================" << std::endl;
 
     int failed = 0;

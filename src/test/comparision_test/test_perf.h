@@ -31,8 +31,8 @@ static void TestMultiReadFewWriteConcurrentPerf(std::function<std::unique_ptr<T>
   std::cout << "Write operations: 50%% insert (50%% existing, 50%% non-existing), 50%% erase (50%% existing, 50%% non-existing)" << "\n";
 
   // 测试参数：所有线程都可以执行读写操作
-  const int TOTAL_THREAD_COUNT = 8;
-  const size_t INIT_DATA_SIZE = 100000;
+  const int TOTAL_THREAD_COUNT = 16;
+  const size_t INIT_DATA_SIZE = 4000000;
   const size_t MAX_OPERATIONS_PER_THREAD = 100000;
   const size_t ITERATIONS = 3;  // 每种写概率执行5次
 
@@ -324,7 +324,7 @@ static void TestMultiReadFewWriteConcurrentPerf(std::function<std::unique_ptr<T>
       }
 
       auto t2 = std::chrono::high_resolution_clock::now();
-      long long total_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+      long long total_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
 
       stop_flag.store(true);
 
@@ -340,12 +340,12 @@ static void TestMultiReadFewWriteConcurrentPerf(std::function<std::unique_ptr<T>
       long long erase_latency_ns = 0;
 
       // 吞吐量计算：基于操作的总耗时
-      double read_throughput = (total_time_ms > 0) ?
-        (read_ops * 1000.0) / total_time_ms : 0.0;
-      double insert_throughput = (total_time_ms > 0) ?
-        (insert_ops * 1000.0) / total_time_ms : 0.0;
-      double erase_throughput = (total_time_ms > 0) ?
-        (erase_ops * 1000.0) / total_time_ms : 0.0;
+      double read_throughput = (total_time_ns > 0) ?
+        (read_ops * 1000000000.0) / total_time_ns : 0.0;
+      double insert_throughput = (total_time_ns > 0) ?
+        (insert_ops * 1000000000.0) / total_time_ns : 0.0;
+      double erase_throughput = (total_time_ns > 0) ?
+        (erase_ops * 1000000000.0) / total_time_ns : 0.0;
       double avg_read_latency = (read_ops > 0) ? (read_latency_ns * 1.0) / read_ops : 0.0;
       double avg_insert_latency = (insert_ops > 0) ? (insert_latency_ns * 1.0) / insert_ops : 0.0;
       double avg_erase_latency = (erase_ops > 0) ? (erase_latency_ns * 1.0) / erase_ops : 0.0;

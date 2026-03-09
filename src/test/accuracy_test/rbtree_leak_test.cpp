@@ -1,5 +1,5 @@
 /*
- * Memory Leak Test for RBTree
+ * Memory Leak Test for ConcurrentRBTree
  * Inspired by folly::ConcurrentSkipList leak tests
  *
  * Uses a type with instance counter to verify all nodes are properly deallocated
@@ -14,7 +14,7 @@
 #include <cassert>
 #include <cstring>
 
-#include "../rbtree.h"
+#include <ConcurrentRBTree.h>
 
 namespace {
 
@@ -75,7 +75,7 @@ struct NonTrivialValue {
 std::atomic<int> NonTrivialValue::InstanceCounter(0);
 const int NonTrivialValue::kBadPayLoad = 0xDEADBEEF;
 
-using RBTreeT = RBTree<NonTrivialValue>;
+using ConcurrentRBTreeT = gipsy_danger::ConcurrentRBTree<NonTrivialValue>;
 
 //=============================================================================
 // Test 1: Basic Deallocation Test
@@ -88,8 +88,8 @@ bool testBasicDeallocation() {
     NonTrivialValue::InstanceCounter.store(0);
 
     {
-        auto rbtree = RBTreeT::createInstance();
-        RBTreeT::Accessor accessor(rbtree);
+        auto rbtree = ConcurrentRBTreeT::createInstance();
+        ConcurrentRBTreeT::Accessor accessor(rbtree);
 
         static const size_t N = 10000;
         std::cout << "  Inserting " << N << " elements..." << std::endl;
@@ -136,8 +136,8 @@ bool testRepeatedCycles() {
     std::cout << "  (" << elementsPerCycle << " elements per cycle)" << std::endl;
 
     for (int cycle = 0; cycle < numCycles; ++cycle) {
-        auto rbtree = RBTreeT::createInstance();
-        RBTreeT::Accessor accessor(rbtree);
+        auto rbtree = ConcurrentRBTreeT::createInstance();
+        ConcurrentRBTreeT::Accessor accessor(rbtree);
 
         for (size_t i = 0; i < elementsPerCycle; ++i) {
             accessor.insert(NonTrivialValue(
@@ -177,12 +177,12 @@ bool testInsertEraseCycles() {
     const int numCycles = 1000;
     const int elementsPerCycle = 100;
 
-    auto rbtree = RBTreeT::createInstance();
+    auto rbtree = ConcurrentRBTreeT::createInstance();
 
     std::cout << "  Running " << numCycles << " insert/erase cycles..." << std::endl;
 
     for (int cycle = 0; cycle < numCycles; ++cycle) {
-        RBTreeT::Accessor accessor(rbtree);
+        ConcurrentRBTreeT::Accessor accessor(rbtree);
 
         // Insert
         for (int i = 0; i < elementsPerCycle; ++i) {
@@ -226,7 +226,7 @@ bool testConcurrentLeakTest() {
     const int numThreads = 8;
     const int opsPerThread = 10000;
 
-    auto rbtree = RBTreeT::createInstance();
+    auto rbtree = ConcurrentRBTreeT::createInstance();
 
     std::cout << "  Running " << numThreads << " threads, "
               << opsPerThread << " ops each..." << std::endl;
@@ -236,7 +236,7 @@ bool testConcurrentLeakTest() {
 
     for (int i = 0; i < numThreads; ++i) {
         threads.emplace_back([&rbtree, i, opsPerThread, &totalOps]() {
-            RBTreeT::Accessor accessor(rbtree);
+            ConcurrentRBTreeT::Accessor accessor(rbtree);
             std::mt19937 gen(i);
             std::uniform_int_distribution<int> valueDist(0, 9999);
             std::uniform_int_distribution<int> opDist(0, 2);
@@ -307,7 +307,7 @@ bool testLongRunningStress() {
     const int durationSeconds = 60;  // Run for 60 seconds
     const int numThreads = 4;
 
-    auto rbtree = RBTreeT::createInstance();
+    auto rbtree = ConcurrentRBTreeT::createInstance();
     std::atomic<bool> stop(false);
 
     std::vector<std::thread> threads;
@@ -315,7 +315,7 @@ bool testLongRunningStress() {
 
     for (int i = 0; i < numThreads; ++i) {
         threads.emplace_back([&rbtree, i, &stop, &totalOps]() {
-            RBTreeT::Accessor accessor(rbtree);
+            ConcurrentRBTreeT::Accessor accessor(rbtree);
             std::mt19937 gen(i);
             std::uniform_int_distribution<int> valueDist(0, 99999);
             std::uniform_int_distribution<int> opDist(0, 2);
@@ -395,11 +395,11 @@ bool testAccessorLifetime() {
     const int elementsPerAccessor = 100;
 
     // Create multiple accessors
-    std::vector<std::shared_ptr<RBTreeT::Accessor>> accessors;
-    auto rbtree = RBTreeT::createInstance();
+    std::vector<std::shared_ptr<ConcurrentRBTreeT::Accessor>> accessors;
+    auto rbtree = ConcurrentRBTreeT::createInstance();
 
     for (int i = 0; i < numAccessors; ++i) {
-        auto acc = std::make_shared<RBTreeT::Accessor>(rbtree);
+        auto acc = std::make_shared<ConcurrentRBTreeT::Accessor>(rbtree);
         for (int j = 0; j < elementsPerAccessor; ++j) {
             acc->insert(NonTrivialValue(i * elementsPerAccessor + j));
         }
@@ -445,8 +445,8 @@ bool testEmptyTreeLeak() {
               << " empty trees..." << std::endl;
 
     for (int i = 0; i < numCycles; ++i) {
-        auto rbtree = RBTreeT::createInstance();
-        RBTreeT::Accessor accessor(rbtree);
+        auto rbtree = ConcurrentRBTreeT::createInstance();
+        ConcurrentRBTreeT::Accessor accessor(rbtree);
         // Don't insert anything, just create and destroy
     }
 
@@ -467,7 +467,7 @@ bool testEmptyTreeLeak() {
 
 int main(int argc, char* argv[]) {
     std::cout << "==================================================" << std::endl;
-    std::cout << "  RBTree Memory Leak Test Suite" << std::endl;
+    std::cout << "  ConcurrentRBTree Memory Leak Test Suite" << std::endl;
     std::cout << "  Inspired by folly::ConcurrentSkipList leak tests" << std::endl;
     std::cout << "==================================================" << std::endl;
 

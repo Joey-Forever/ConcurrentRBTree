@@ -1,9 +1,9 @@
 /*
- * Concurrent Correctness Test for RBTree
+ * Concurrent Correctness Test for ConcurrentRBTree
  * Inspired by folly::ConcurrentSkipList test framework
  *
  * This test file verifies the correctness of concurrent read-write operations
- * on RBTree, including insert, erase, point find, and range query operations.
+ * on ConcurrentRBTree, including insert, erase, point find, and range query operations.
  */
 
 #include <iostream>
@@ -17,13 +17,13 @@
 #include <algorithm>
 #include <iomanip>
 
-#include "../rbtree.h"
+#include <ConcurrentRBTree.h>
 
 namespace {
 
 using ValueType = int;
-using RBTreeType = RBTree<ValueType>;
-using RBTreeAccessor = RBTreeType::Accessor;
+using ConcurrentRBTreeType = gipsy_danger::ConcurrentRBTree<ValueType>;
+using ConcurrentRBTreeAccessor = ConcurrentRBTreeType::Accessor;
 using SetType = std::set<ValueType>;
 
 static const int kMaxValue = 5000;
@@ -45,7 +45,7 @@ inline int32_t randomInt32(int32_t max_value) {
 // Random adding operation - inserts random values into both rbtree and verifier
 static void randomAdding(
     int size,
-    RBTreeAccessor& rbtree,
+    ConcurrentRBTreeAccessor& rbtree,
     SetType* verifier,
     int maxValue = kMaxValue) {
     for (int i = 0; i < size; ++i) {
@@ -58,7 +58,7 @@ static void randomAdding(
 // Random removal operation - removes random values from rbtree
 static void randomRemoval(
     int size,
-    RBTreeAccessor& rbtree,
+    ConcurrentRBTreeAccessor& rbtree,
     SetType* verifier,
     int maxValue = kMaxValue) {
     for (int i = 0; i < size; ++i) {
@@ -69,7 +69,7 @@ static void randomRemoval(
 }
 
 // Sum all values using iterator - tests iteration correctness
-static void sumAllValues(RBTreeAccessor& rbtree, int64_t* sum) {
+static void sumAllValues(ConcurrentRBTreeAccessor& rbtree, int64_t* sum) {
     *sum = 0;
     for (auto it = rbtree.begin(); it != rbtree.end(); ++it) {
         *sum += *it;
@@ -79,7 +79,7 @@ static void sumAllValues(RBTreeAccessor& rbtree, int64_t* sum) {
 // Range query using lower_bound - tests range find correctness
 static void concurrentRangeQuery(
     const std::vector<ValueType>* values,
-    RBTreeAccessor& rbtree,
+    ConcurrentRBTreeAccessor& rbtree,
     int64_t* result) {
     *result = 0;
     for (const auto& target : *values) {
@@ -91,7 +91,7 @@ static void concurrentRangeQuery(
 }
 
 // Verify equality between rbtree and std::set verifier
-bool verifyEqual(RBTreeAccessor& rbtree, const SetType& verifier) {
+bool verifyEqual(ConcurrentRBTreeAccessor& rbtree, const SetType& verifier) {
     // Check size
     if (verifier.size() != rbtree.size()) {
         std::cerr << "Size mismatch: verifier=" << verifier.size()
@@ -142,8 +142,8 @@ bool verifyEqual(RBTreeAccessor& rbtree, const SetType& verifier) {
 bool testSequentialAccess() {
     std::cout << "\n=== Test 1: SequentialAccess ===" << std::endl;
 
-    auto rbtree = RBTreeType::createInstance();
-    RBTreeAccessor accessor(rbtree);
+    auto rbtree = ConcurrentRBTreeType::createInstance();
+    ConcurrentRBTreeAccessor accessor(rbtree);
 
     // Test empty tree
     assert(accessor.empty());
@@ -200,8 +200,8 @@ bool testConcurrentAdd() {
     std::cout << "\n=== Test 2: ConcurrentAdd ===" << std::endl;
 
     int numThreads = 100;
-    auto rbtree = RBTreeType::createInstance();
-    RBTreeAccessor accessor(rbtree);
+    auto rbtree = ConcurrentRBTreeType::createInstance();
+    ConcurrentRBTreeAccessor accessor(rbtree);
 
     std::vector<std::thread> threads;
     std::vector<SetType> verifiers(numThreads);
@@ -247,8 +247,8 @@ void testConcurrentRemoval(int numThreads, int maxValue) {
     std::cout << "\n=== Test 3: ConcurrentRemove (threads=" << numThreads
               << ", maxValue=" << maxValue << ") ===" << std::endl;
 
-    auto rbtree = RBTreeType::createInstance();
-    RBTreeAccessor accessor(rbtree);
+    auto rbtree = ConcurrentRBTreeType::createInstance();
+    ConcurrentRBTreeAccessor accessor(rbtree);
 
     // Pre-populate the tree
     for (int i = 0; i < maxValue; ++i) {
@@ -314,8 +314,8 @@ static void testConcurrentAccess(
               << ", numDeletions=" << numDeletions
               << ", maxValue=" << maxValue << std::endl;
 
-    auto rbtree = RBTreeType::createInstance();
-    RBTreeAccessor accessor(rbtree);
+    auto rbtree = ConcurrentRBTreeType::createInstance();
+    ConcurrentRBTreeAccessor accessor(rbtree);
 
     std::vector<SetType> verifiers(numThreads);
     std::vector<int64_t> sums(numThreads);
@@ -398,8 +398,8 @@ static void testConcurrentAccess(
 bool testRangeQuery() {
     std::cout << "\n=== Test 5: RangeQuery ===" << std::endl;
 
-    auto rbtree = RBTreeType::createInstance();
-    RBTreeAccessor accessor(rbtree);
+    auto rbtree = ConcurrentRBTreeType::createInstance();
+    ConcurrentRBTreeAccessor accessor(rbtree);
 
     // Insert specific values
     std::vector<int> values = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
@@ -442,8 +442,8 @@ bool testRangeQuery() {
 bool testStressTest() {
     std::cout << "\n=== Test 6: StressTest ===" << std::endl;
 
-    auto rbtree = RBTreeType::createInstance();
-    RBTreeAccessor accessor(rbtree);
+    auto rbtree = ConcurrentRBTreeType::createInstance();
+    ConcurrentRBTreeAccessor accessor(rbtree);
 
     const int numThreads = 16;
     const int opsPerThread = 100000;
@@ -514,8 +514,8 @@ bool testStressTest() {
 bool testIteratorStressTest() {
     std::cout << "\n=== Test 7: IteratorStressTest ===" << std::endl;
 
-    auto rbtree = RBTreeType::createInstance();
-    RBTreeAccessor accessor(rbtree);
+    auto rbtree = ConcurrentRBTreeType::createInstance();
+    ConcurrentRBTreeAccessor accessor(rbtree);
 
     const int numElements = 100000;
 
@@ -552,7 +552,7 @@ bool testIteratorStressTest() {
 
 int main(int argc, char* argv[]) {
     std::cout << "==================================================" << std::endl;
-    std::cout << "  RBTree Concurrent Correctness Test Suite" << std::endl;
+    std::cout << "  ConcurrentRBTree Concurrent Correctness Test Suite" << std::endl;
     std::cout << "  Inspired by folly::ConcurrentSkipList tests" << std::endl;
     std::cout << "==================================================" << std::endl;
 

@@ -1,11 +1,13 @@
 /*
  * ConcurrentRBTree Performance Test
  *
- * Build:
-  g++ concurrent_rbtree_perf_test.cpp -o rbtree_test -std=c++17 -pthread -O2 -DNDEBUG
+ * Build for Linux (with C++17, -O2, no LTO):
+  g++ concurrent_rbtree_perf_test.cpp -o concurrent_rbtree_perf_test \
+    -std=c++17 -pthread -O2 -march=x86-64 -DNDEBUG \
+    -I/home/joey/Documents/joey_project/ConcurrentRBTree/src/include
  */
 
-#include "../rbtree.h"
+#include <ConcurrentRBTree.h>
 #include <iostream>
 #include <thread>
 #include <vector>
@@ -21,8 +23,8 @@
 #include <tuple>
 #include "test_perf.h"
 
-using RBTreeT = RBTree<int>;
-using RBTreeAccessor = RBTreeT::Accessor;
+using ConcurrentRBTreeT = gipsy_danger::ConcurrentRBTree<int>;
+using ConcurrentRBTreeAccessor = ConcurrentRBTreeT::Accessor;
 
 static void checkCompileMode() {
 #ifndef NDEBUG
@@ -33,10 +35,10 @@ static void checkCompileMode() {
 }
 
 int main() {
-  std::cout << "RBTree Performance Test" << "\n";
+  std::cout << "ConcurrentRBTree Performance Test" << "\n";
   checkCompileMode();
-  TestMultiReadFewWriteConcurrentPerf<RBTreeAccessor>([]() {
-    auto rbtree = RBTreeT::createInstance();
-    return std::make_unique<RBTreeAccessor>(rbtree);
+  TestMultiReadFewWriteConcurrentPerf<ConcurrentRBTreeAccessor>([]() {
+    auto rbtree = ConcurrentRBTreeT::createInstance();
+    return std::make_unique<ConcurrentRBTreeAccessor>(rbtree);
   });
 }

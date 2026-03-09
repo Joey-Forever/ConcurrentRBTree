@@ -12,12 +12,12 @@
 #include <mutex>
 #include <memory>
 
-#include "../rbtree.h"
+#include <ConcurrentRBTree.h>
 
 static void TestSingleThreadAbility(bool sequential_insert) {
   std::cout << "------------------------------------------------------------------------------------------------" << "\n";
   std::cout << "single thread test (sequential_insert = " << (sequential_insert ? "true" : "false") << "):\n";
-  RBTree<int>::Accessor accessor(RBTree<int>::createInstance());
+  gipsy_danger::ConcurrentRBTree<int>::Accessor accessor(gipsy_danger::ConcurrentRBTree<int>::createInstance());
   int times = 100;
   std::deque<int> vec_for_map;
   int max_val = 0;
@@ -60,7 +60,7 @@ static void checkCompileMode() {
 }
 
 int main() {
-  std::cout << "RBTree Performance Test" << "\n";
+  std::cout << "ConcurrentRBTree Performance Test" << "\n";
   checkCompileMode();
   TestSingleThreadAbility(false);
   TestSingleThreadAbility(true);

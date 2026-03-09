@@ -1,10 +1,10 @@
 /*
- * Non-Trivial Type Tests for RBTree
+ * Non-Trivial Type Tests for ConcurrentRBTree
  * Inspired by folly::ConcurrentSkipList type tests
  *
  * Tests:
  * 1. std::string - non-trivial copy type
- * 2. Wrapper for unique_ptr - since RBTree doesn't support custom comparator
+ * 2. Wrapper for unique_ptr - since ConcurrentRBTree doesn't support custom comparator
  * 3. NonTrivialValue - type with instance counter for destructor verification
  */
 
@@ -19,7 +19,7 @@
 #include <thread>
 #include <functional>
 
-#include "../rbtree.h"
+#include <ConcurrentRBTree.h>
 
 namespace {
 
@@ -40,9 +40,9 @@ static std::string makeRandomString(int len) {
 bool testStringType() {
     std::cout << "\n=== Test: StringType (std::string) ===" << std::endl;
 
-    using RBTreeT = RBTree<std::string>;
-    auto rbtree = RBTreeT::createInstance();
-    RBTreeT::Accessor accessor(rbtree);
+    using ConcurrentRBTreeT = gipsy_danger::ConcurrentRBTree<std::string>;
+    auto rbtree = ConcurrentRBTreeT::createInstance();
+    ConcurrentRBTreeT::Accessor accessor(rbtree);
 
     {
         for (int i = 0; i < 100000; i++) {
@@ -118,7 +118,7 @@ public:
         return *this;
     }
 
-    // Copy constructor (needed for RBTree)
+    // Copy constructor (needed for ConcurrentRBTree)
     MoveOnlyValue(const MoveOnlyValue& other)
         : value_(other.value_), owns_(true) {}
 
@@ -158,9 +158,9 @@ private:
 bool testMovableData() {
     std::cout << "\n=== Test: MovableData (MoveOnlyValue<int>) ===" << std::endl;
 
-    using RBTreeT = RBTree<MoveOnlyValue<int> >;
-    auto rbtree = RBTreeT::createInstance();
-    RBTreeT::Accessor accessor(rbtree);
+    using ConcurrentRBTreeT = gipsy_danger::ConcurrentRBTree<MoveOnlyValue<int> >;
+    auto rbtree = ConcurrentRBTreeT::createInstance();
+    ConcurrentRBTreeT::Accessor accessor(rbtree);
 
     static const int N = 10;
     for (int i = 0; i < N; ++i) {
@@ -258,14 +258,14 @@ const int NonTrivialValue::kBadPayLoad = 0xDEADBEEF;
 bool testNonTrivialDeallocation() {
     std::cout << "\n=== Test: NonTrivialDeallocation ===" << std::endl;
 
-    using RBTreeT = RBTree<NonTrivialValue>;
+    using ConcurrentRBTreeT = gipsy_danger::ConcurrentRBTree<NonTrivialValue>;
 
     // Reset counter
     NonTrivialValue::InstanceCounter.store(0);
 
     {
-        auto rbtree = RBTreeT::createInstance();
-        RBTreeT::Accessor accessor(rbtree);
+        auto rbtree = ConcurrentRBTreeT::createInstance();
+        ConcurrentRBTreeT::Accessor accessor(rbtree);
 
         static const size_t N = 10000;
         std::cout << "  Inserting " << N << " NonTrivialValue elements..." << std::endl;
@@ -323,8 +323,8 @@ bool testNonTrivialDeallocation() {
 bool testConcurrentStringType() {
     std::cout << "\n=== Test: ConcurrentStringType ===" << std::endl;
 
-    using RBTreeT = RBTree<std::string>;
-    auto rbtree = RBTreeT::createInstance();
+    using ConcurrentRBTreeT = gipsy_danger::ConcurrentRBTree<std::string>;
+    auto rbtree = ConcurrentRBTreeT::createInstance();
 
     const int numThreads = 8;
     const int stringsPerThread = 10000;
@@ -333,7 +333,7 @@ bool testConcurrentStringType() {
 
     for (int i = 0; i < numThreads; ++i) {
         threads.emplace_back([&rbtree, i]() {
-            RBTreeT::Accessor accessor(rbtree);
+            ConcurrentRBTreeT::Accessor accessor(rbtree);
             thread_local std::mt19937 gen(i);
             std::uniform_int_distribution<int> lenDist(3, 15);
             std::uniform_int_distribution<int> charDist('A', 'Z');
@@ -353,7 +353,7 @@ bool testConcurrentStringType() {
         t.join();
     }
 
-    RBTreeT::Accessor accessor(rbtree);
+    ConcurrentRBTreeT::Accessor accessor(rbtree);
     size_t totalCount = 0;
     for (auto it = accessor.begin(); it != accessor.end(); ++it) {
         totalCount++;
@@ -386,9 +386,9 @@ bool testConcurrentStringType() {
 bool testSortedStringInsert() {
     std::cout << "\n=== Test: SortedStringInsert ===" << std::endl;
 
-    using RBTreeT = RBTree<std::string>;
-    auto rbtree = RBTreeT::createInstance();
-    RBTreeT::Accessor accessor(rbtree);
+    using ConcurrentRBTreeT = gipsy_danger::ConcurrentRBTree<std::string>;
+    auto rbtree = ConcurrentRBTreeT::createInstance();
+    ConcurrentRBTreeT::Accessor accessor(rbtree);
 
     // Insert strings in sorted order (worst case for some tree implementations)
     const int N = 10000;
@@ -423,9 +423,9 @@ bool testSortedStringInsert() {
 bool testEmptyAndSingleString() {
     std::cout << "\n=== Test: EmptyAndSingleString ===" << std::endl;
 
-    using RBTreeT = RBTree<std::string>;
-    auto rbtree = RBTreeT::createInstance();
-    RBTreeT::Accessor accessor(rbtree);
+    using ConcurrentRBTreeT = gipsy_danger::ConcurrentRBTree<std::string>;
+    auto rbtree = ConcurrentRBTreeT::createInstance();
+    ConcurrentRBTreeT::Accessor accessor(rbtree);
 
     // Test empty
     assert(accessor.empty());
@@ -465,8 +465,8 @@ bool testConcurrentNonTrivial() {
     // Reset counter
     NonTrivialValue::InstanceCounter.store(0);
 
-    using RBTreeT = RBTree<NonTrivialValue>;
-    auto rbtree = RBTreeT::createInstance();
+    using ConcurrentRBTreeT = gipsy_danger::ConcurrentRBTree<NonTrivialValue>;
+    auto rbtree = ConcurrentRBTreeT::createInstance();
 
     const int numThreads = 8;
     const int opsPerThread = 1000;
@@ -475,7 +475,7 @@ bool testConcurrentNonTrivial() {
 
     for (int i = 0; i < numThreads; ++i) {
         threads.emplace_back([&rbtree, i, opsPerThread]() {
-            RBTreeT::Accessor accessor(rbtree);
+            ConcurrentRBTreeT::Accessor accessor(rbtree);
             std::mt19937 gen(i);
             std::uniform_int_distribution<int> valueDist(0, 999);
 
@@ -490,7 +490,7 @@ bool testConcurrentNonTrivial() {
         t.join();
     }
 
-    RBTreeT::Accessor accessor(rbtree);
+    ConcurrentRBTreeT::Accessor accessor(rbtree);
     size_t finalSize = accessor.size();
     int instanceCount = NonTrivialValue::InstanceCounter.load();
 
@@ -506,9 +506,9 @@ bool testConcurrentNonTrivial() {
 bool testStringFindEraseStress() {
     std::cout << "\n=== Test: StringFindEraseStress ===" << std::endl;
 
-    using RBTreeT = RBTree<std::string>;
-    auto rbtree = RBTreeT::createInstance();
-    RBTreeT::Accessor accessor(rbtree);
+    using ConcurrentRBTreeT = gipsy_danger::ConcurrentRBTree<std::string>;
+    auto rbtree = ConcurrentRBTreeT::createInstance();
+    ConcurrentRBTreeT::Accessor accessor(rbtree);
 
     // Insert specific strings
     std::vector<std::string> testStrings = {
@@ -552,7 +552,7 @@ bool testStringFindEraseStress() {
 
 int main(int argc, char* argv[]) {
     std::cout << "==================================================" << std::endl;
-    std::cout << "  RBTree Non-Trivial Type Tests" << std::endl;
+    std::cout << "  ConcurrentRBTree Non-Trivial Type Tests" << std::endl;
     std::cout << "  Inspired by folly::ConcurrentSkipList type tests" << std::endl;
     std::cout << "==================================================" << std::endl;
 

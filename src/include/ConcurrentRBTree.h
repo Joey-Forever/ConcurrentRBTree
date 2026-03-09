@@ -3,13 +3,8 @@
 #include <iostream>
 #include <vector>
 #include <atomic>
-#include <map>
-#include <set>
-#include <chrono>
-#include <random>
 #include <thread>
 #include <cassert>
-#include <deque>
 #include <iterator>
 #include <mutex>
 #include <memory>
@@ -27,6 +22,7 @@ namespace gipsy_danger {
 // type KEY must implement operator< and operator==.
 // type KEY and type VALUE must define default constructor.
 // type VALUE must define move constructor.
+// TODO(Joey): support custom comparator.
 template <typename VALUE>
 class ConcurrentRBTree {
  public:
