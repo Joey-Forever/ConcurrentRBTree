@@ -2,16 +2,25 @@
 
   # ⚡ gipsy_danger::ConcurrentRBTree
 
-  ### A High-Performance Concurrent Red-Black Tree for Large-Scale Read-Intensive Workloads
+  ### A Drop-In Replacement for folly::ConcurrentSkipList, Optimized for Read-Heavy Workloads
 
-  [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-  [![C++](https://img.shields.io/badge/C++-17-blue.svg)](https://isocpp.org/)
-  [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg)](https://github.com/)
-  [![Concurrency](https://img.shields.io/badge/concurrency-lock--free%20reads-brightgreen.svg)]()
+  [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+  [![C++17](https://img.shields.io/badge/C++-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
+  [![Header-only](https://img.shields.io/badge/header--only-yes-brightgreen.svg)](src/include/ConcurrentRBTree.h)
+  [![Drop-in for folly::ConcurrentSkipList](https://img.shields.io/badge/drop--in-folly::ConcurrentSkipList-blue.svg)](#api-reference)
 
   **Up to 1.7x faster than folly::ConcurrentSkipList in read-heavy workloads**
 
 </div>
+
+<p align="center">
+  <img src="src/test/comparision_test/x86_result/throughput_16threads_8000000init.jpg" alt="ConcurrentRBTree vs folly::ConcurrentSkipList — 16 threads, 8M entries, Intel i9-13900K" width="900"/>
+  <br/>
+  <em>16 threads · 8M entries · <code>int32_t</code> · Intel i9-13900K</em>
+  <br/>
+  <a href="#-why-is-it-faster"><strong>Why?</strong></a> ·
+  <a href="src/test/comparision_test/x86_result/"><strong>Full benchmark matrix (1 / 16 / 27 threads × 10⁵ / 10⁶ / 4·10⁶ / 8·10⁶ entries)</strong></a>
+</p>
 
 ---
 
@@ -56,16 +65,12 @@ All benchmarks were conducted on a high-performance system:
 - **Balanced write operations** – For any write probability, `insert` and `erase` operations are evenly distributed (50% each)
 - **Realistic data patterns** – 50% of `insert` operations target existing keys, 50% target new keys; same distribution for `erase` operations
 
-### Concurrent Read/Write Throughput (16 Threads, 8M Initial Entries)
+### Scaling to 27 Threads (8M Initial Entries)
+
+The hero chart above shows the 16-thread picture. Pushing concurrency to 27 threads (avoiding the 32-thread setting so as not to compete with OS / background processes) keeps the advantage intact — both implementations peak here, and <code>gipsy_danger::ConcurrentRBTree</code> still leads by **1.41× aggregate** and **~1.5× on reads**.
 
 <p align="center">
-  <img src="src/test/comparision_test/x86_result/throughput_16threads_8000000init.jpg" alt="16-Thread Performance Benchmark" width="800"/>
-</p>
-
-### Concurrent Read/Write Throughput (27 Threads, 8M Initial Entries)
-
-<p align="center">
-  <img src="src/test/comparision_test/x86_result/throughput_27threads_8000000init.jpg" alt="27-Thread Performance Benchmark" width="800"/>
+  <img src="src/test/comparision_test/x86_result/throughput_27threads_8000000init.jpg" alt="27-Thread Performance Benchmark — RBTree still leads at peak concurrency" width="800"/>
 </p>
 
 ### Key Results
