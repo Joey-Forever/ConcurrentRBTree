@@ -239,31 +239,19 @@ For comprehensive test results covering different thread counts and initial data
 
 **Red-Black Tree — O(log n) Lookup**
 
-```mermaid
-graph TD
-    A(["30 BLACK"]) -->|Left| B(["10 RED"])
-    A -->|Right| C(["50 RED"])
-    B -->|Right| D(["20 BLACK"])
-
-    style A fill:#333,stroke:#333,color:#fff
-    style B fill:#cc0000,stroke:#cc0000,color:#fff
-    style C fill:#cc0000,stroke:#cc0000,color:#fff
-    style D fill:#333,stroke:#333,color:#fff
-```
+<p align="center">
+  <img src="docs/architecture/rbtree.svg" alt="Red-Black Tree — approximate index with relaxed-atomic child pointers" width="720"/>
+</p>
 
 **Sorted Linked List — Ground Truth**
 
-```mermaid
-graph LR
-    H1["header"] --> E(["10"]) --> F(["20"]) --> G(["30"]) --> I(["50"]) --> T1["tailer"]
+<p align="center">
+  <img src="docs/architecture/sorted_list.svg" alt="Sorted Linked List — authoritative order with acquire/release next_ pointers" width="720"/>
+</p>
 
-    style E fill:#2266ac,stroke:#2266ac,color:#fff
-    style F fill:#2266ac,stroke:#2266ac,color:#fff
-    style G fill:#2266ac,stroke:#2266ac,color:#fff
-    style I fill:#2266ac,stroke:#2266ac,color:#fff
-    style H1 fill:#eee,stroke:#999,color:#666
-    style T1 fill:#eee,stroke:#999,color:#666
-```
+<p align="center">
+  <em>Two indexes, one set of nodes: every blue box in the list and every colored circle in the tree is the same physical <code>Node*</code> in memory.</em>
+</p>
 
 - The **red-black tree** provides fast O(log n) positioning, but its structure may be temporarily inconsistent during write-side rotations.
 - The **sorted linked list** (connected via atomic `next_` pointers) serves as the authoritative ordered view — readers fall back to it when tree traversal is disrupted by concurrent modifications.
