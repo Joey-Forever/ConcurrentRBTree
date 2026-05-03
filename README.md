@@ -38,7 +38,6 @@
 - **Lock-free reads** – Multiple threads can read concurrently without blocking
 - **Efficient range query support** – Iterator-based traversal with **linked-list-like performance** via internal linked list (no expensive inorder traversal)
 - **Scales with data size** – Performance advantage over `folly::ConcurrentSkipList` increases at larger scales (millions of entries)
-- **Weak consistency guarantees** – Identical to `folly::ConcurrentSkipList`: readers may see stale data but never corrupted state
 - **Epoch-based garbage collection** – Memory-safe concurrent access pattern
 - **Header-only library** – Easy integration, just include the header
 - **STL-like API** – Familiar interface with `find`, `insert`, `erase`, `lower_bound`, iterators
@@ -212,17 +211,6 @@ int main() {
 - **✅ Thread-safe writes**: Multiple threads can write concurrently (search phase is lock-free, only structural modifications are serialized)
 - **✅ Thread-safe mixed operations**: Reads and writes can occur simultaneously
 
-### Consistency Guarantees
-
-`gipsy_danger::ConcurrentRBTree` provides **weak consistency guarantees**, identical to `folly::ConcurrentSkipList`:
-
-- Readers may observe stale data but will never see corrupted state
-- Writes become visible to all threads atomically
-- No guarantees on immediate visibility across threads
-- Iterators remain valid during concurrent modifications (may reflect stale or updated state)
-
----
-
 ## 📊 More Benchmark Data
 
 For comprehensive test results covering different thread counts and initial data sizes, visit our benchmark results directory:
@@ -305,11 +293,13 @@ The project includes comprehensive test coverage:
 ### Leak Detection
 - Memory leak verification under concurrent workloads
 
-Build tests:
+Example test build:
 
 ```bash
-cd src/test
-make
+g++ -std=c++17 -Wall -Wextra -O2 -g -Isrc/include \
+  src/test/accuracy_test/rbtree_edge_case_test.cpp \
+  -o /tmp/rbtree_edge_case_test -pthread
+/tmp/rbtree_edge_case_test
 ```
 
 ---

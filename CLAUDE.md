@@ -40,10 +40,8 @@ A virtual `root_` sentinel node holds the actual tree root as its left child.
 src/
   include/
     ConcurrentRBTree.h    # The entire library (header-only, ~1000 lines)
-  Makefile                # Top-level (header-only, nothing to compile)
   test/
-    Makefile              # Test build system (clang++, C++20, Google Test/Benchmark)
-    accuracy_test/        # Correctness tests (Google Test)
+    accuracy_test/        # Correctness, edge-case, type, leak, and concurrency tests
       rbtree_single_thread_ability.cpp
       rbtree_concurrent_test.cpp
       rbtree_edge_case_test.cpp
@@ -60,19 +58,20 @@ src/
 ## Build & Test
 
 ```bash
-# Build and run accuracy tests (requires Google Test)
-cd src/test && make test
+# Build and run an accuracy test directly
+g++ -std=c++17 -Wall -Wextra -O2 -g -Isrc/include \
+  src/test/accuracy_test/rbtree_edge_case_test.cpp \
+  -o /tmp/rbtree_edge_case_test -pthread
+/tmp/rbtree_edge_case_test
 
-# Build performance tests (requires Google Benchmark + Folly)
-cd src/test && make perf
-
-# Run performance tests
-cd src/test && make run-perf
+# Build the RBTree performance benchmark directly
+g++ -std=c++17 -pthread -O2 -DNDEBUG -Isrc/include \
+  src/test/comparision_test/concurrent_rbtree_perf_test.cpp \
+  -o /tmp/concurrent_rbtree_perf_test
 ```
 
-- Compiler: `clang++` with `-std=c++20 -Wall -Wextra -O2 -g`
-- Dependencies: Google Test (accuracy), Google Benchmark + Folly (performance comparison)
-- Build output goes to `build/` directory (two levels up from `src/test/`)
+- Accuracy tests are standalone C++ programs under `src/test/accuracy_test`.
+- The skiplist comparison benchmark requires Folly and environment-specific include/link paths.
 - Use `-DNDEBUG` for production builds to disable `RB_ASSERT` assertions
 
 ## API
@@ -92,10 +91,3 @@ for (auto it = accessor.begin(); it != accessor.end(); ++it) { ... }
 - `VALUE` must support `operator<`, `operator==`, default construction, and move construction.
 - Custom comparators are not yet supported.
 - `const_iterator` is not yet supported.
-
-## Consistency Guarantees
-
-Weak consistency (same as `folly::ConcurrentSkipList`):
-- Readers may see stale data but never corrupted state
-- Writes become visible atomically via the `accessible_` flag
-- Iterators use `accessibleNext()` to skip inaccessible (being-erased) nodes
